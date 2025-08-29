@@ -444,8 +444,7 @@ async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: 
     _message_id = message_id or str(uuid4())
     local_team = make_team_for_suite(suite_id, message_id)
     
-    _task_with_id = f"[message_id={_message_id}] {task}"
-    async for event in local_team.run_stream(task=_task_with_id):
+    async for event in local_team.run_stream(task=task):
         print(event)
         try:
             _event_payload = json.loads(event.model_dump_json())
