@@ -80,7 +80,7 @@ def make_team_for_suite(bound_suite_id: Optional[str], message_id: Optional[str]
                 continue
             _write_text(docs_dir / name, text)
             stored.append(name)
-        return {"suite_id": suite_id_value, "stored": stored, "missing": missing}
+        return {"stored": stored, "missing": missing}
 
     def extract_and_store_requirements() -> Dict[str, Any]:
         sdir = SESSIONS_ROOT / suite_id_value
@@ -139,14 +139,13 @@ Documents:
             pass
 
         return {
-            "suite_id": suite_id_value,
             "requirements_artifact": f"db://requirements/{suite_id_value}",
         }
 
     def list_requirement_ids() -> Dict[str, Any]:
         reqs = _SUITE_REQUIREMENTS.get(suite_id_value) or []
         ids = [r.get("id") for r in reqs if isinstance(r, dict) and r.get("id")]
-        return {"suite_id": suite_id_value, "ids": ids}
+        return {"ids": ids}
 
     def generate_and_store_testcases_for_req(
         req_id: str, style: str = "json"
@@ -211,11 +210,7 @@ Requirement text:
         except Exception:
             pass
 
-        return {
-            "suite_id": suite_id_value,
-            "req_id": req_id,
-            "artifact": f"db://testcases/{req_id}",
-        }
+        return "Test cases generated successfully"
 
     def generate_preview_requirements(limit: int = 5) -> Dict[str, Any]:
         """Create a small preview list of requirements without persisting anything."""
@@ -263,12 +258,12 @@ Documents:
         except Exception as e:
             raise ValueError(f"Invalid JSON from preview requirements: {e}")
 
-        return {"suite_id": suite_id_value, "preview_requirements": preview_reqs[:limit]}
+        return {"preview_requirements": preview_reqs[:limit]}
 
     def generate_preview_testcases(requirements: List[Dict[str, Any]], per_req: int = 1) -> Dict[str, Any]:
         """Create a tiny preview of test cases for provided requirement objects."""
         if not requirements:
-            return {"suite_id": suite_id_value, "samples": []}
+            return {"samples": []}
         # Limit total size for cost/latency
         reqs_limited = requirements[: min(len(requirements), 3)]
 
@@ -286,7 +281,6 @@ For each requirement below, produce {per_req} concise case.
 
 Return ONLY a JSON object (no markdown):
 {{
-  "suite_id": "{suite_id_value}",
   "samples": [
     {{"requirement_id": "<id>", "cases": [{{"type": "preview", "title": "<short>", "steps": ["..."], "expected": "..."}}]}}
   ]
@@ -358,16 +352,17 @@ Requirements:
         handoffs=["fetcher", "requirements_extractor", "testcase_writer"],
         tools=[generate_preview_requirements, generate_preview_testcases, ask_user],
         system_message=(
-            "You are the planner. Keep outputs tiny and always include suite_id.\n"
+            "You are the planner. Keep outputs tiny.\n"
             "Decision:\n"
-            "- If the latest user message contains the exact token CONTINUE, skip preview and execute full flow: handoff to requirements_extractor, then testcase_writer, then summarize and TERMINATE.\n"
-            "- Otherwise, do a preview flow:\n"
+            "- Do a preview flow:\n"
             "  1) Parse user input for doc names.\n"
             "  2) Handoff to fetcher with the names.\n"
             "  3) Call generate_preview_requirements(limit=5).\n"
             "  4) Call generate_preview_testcases(requirements=<from step 3>, per_req=1).\n"
-            "  5) Return a compact preview: suite_id, a few requirement ids+texts, and one preview testcase per requirement.\n"
-            "  6) Call ask_user(event_type=\"sample_confirmation\", response_to_user=\"<1-2 lines>\") to request confirmation; this writes an event and returns TERMINATE.\n"
+            "  5) Return a compact preview: a few requirement ids+texts, and one preview testcase per requirement.\n"
+            "  6) Call ask_user(event_type=\"sample_confirmation\", response_to_user=\"<1-2 lines>\") to request confirmation; this writes an event\n"
+            "  7) If the user confirms, handoff to requirements_extractor, then testcase_writer, then summarize and write the word TERMINATE to end.\n"
+            # "  8) If the user does not confirm, return the preview and TERMINATE.\n"
             "Never paste large content."
         ),
     )
@@ -379,7 +374,7 @@ Requirements:
         tools=[store_docs_from_blob],
         system_message=(
             "Load docs using store_docs_from_blob(doc_names).\n"
-            "Reply only: suite_id, stored, missing. No file content.\n"
+            "Reply only: stored, missing. No file content.\n"
             "Then handoff to planner for preview unless explicitly instructed to continue."
         ),
     )
@@ -391,7 +386,7 @@ Requirements:
         tools=[extract_and_store_requirements],
         system_message=(
             "Call extract_and_store_requirements().\n"
-            "Reply only: suite_id, requirements_artifact.\n"
+            "Reply only: requirements_artifact.\n"
             "Then handoff to testcase_writer."
         ),
     )
@@ -404,7 +399,6 @@ Requirements:
         system_message=(
             "1) Call list_requirement_ids() to get only IDs.\n"
             "2) For each id, call generate_and_store_testcases_for_req(req_id).\n"
-            "3) Output a minimal MANIFEST table with (req_id, artifact) only.\n"
             "Do not inline any test content.\n"
             "Then handoff to planner."
         ),
