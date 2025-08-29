@@ -40,6 +40,20 @@ class ResultsWriter:
     ) -> None:
         raise NotImplementedError
 
+    def get_suite_state(
+        self,
+        *,
+        suite_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest saved suite state (prefer nested agent_state).
+
+        Implementations should return:
+        - state["agent_state"] if present and a dict
+        - else the raw state if it is a dict
+        - else None
+        """
+        raise NotImplementedError
+
 
 class NoopResultsWriter(ResultsWriter):
     def write_requirements(
@@ -76,6 +90,13 @@ class NoopResultsWriter(ResultsWriter):
         suite_id: Optional[str],
         state: Dict[str, Any],
     ) -> None:
+        return None
+
+    def get_suite_state(
+        self,
+        *,
+        suite_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
         return None
 
 
@@ -237,3 +258,29 @@ class SupabaseResultsWriter(ResultsWriter):
         self._client.table("test_suites").update({"state": current}).eq(
             "id", suite_id
         ).execute()
+
+    def get_suite_state(
+        self,
+        *,
+        suite_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not suite_id:
+            return None
+        data = (
+            self._client.table("test_suites")
+            .select("id, state")
+            .eq("id", suite_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not data:
+            return None
+        state_obj = data[0].get("state")
+        if isinstance(state_obj, dict):
+            agent_state = state_obj.get("agent_state")
+            if isinstance(agent_state, dict):
+                return agent_state
+            return state_obj
+        return None

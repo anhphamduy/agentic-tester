@@ -16,7 +16,7 @@ from autogen_agentchat.teams import Swarm
 from autogen_agentchat.ui import Console
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from openai import OpenAI
-from app.settings import global_settings, blob_storage, results_writer
+from app.settings import global_settings, blob_storage, results_writer, supabase_client
 
 # -----------------------------
 # Storage roots / providers
@@ -440,9 +440,25 @@ termination = TextMentionTermination("TERMINATE") | HandoffTermination(target="u
 # Removed run_async_with_suite in favor of streaming-only execution for event logging
 
 
+def _get_suite_agent_state(suite_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Fetch previously saved team state for a suite via results writer."""
+    try:
+        return _results_writer.get_suite_state(suite_id=suite_id)
+    except Exception:
+        return None
+
+
 async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: Optional[str] = None):
     _message_id = message_id or str(uuid4())
     local_team = make_team_for_suite(suite_id, message_id)
+    # Best-effort: load prior team state if the suite exists and has stored state
+    try:
+        prior_state = _get_suite_agent_state(suite_id)
+        if prior_state:
+            await local_team.load_state(prior_state)
+    except Exception as e:
+        # Do not block execution if state loading fails
+        print(f"Error loading team state: {e}")
     
     async for event in local_team.run_stream(task=task):
         print(event)
@@ -456,8 +472,8 @@ async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: 
             print(f"Error writing event: {e}")
             pass
         yield event
-    
-    await local_team.save_state()
+
+    _results_writer.write_suite_state(suite_id=suite_id, state=await local_team.save_state())
 
 
 # -----------------------------
