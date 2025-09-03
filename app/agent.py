@@ -114,11 +114,11 @@ Documents:
 
         resp = _oai.chat.completions.create(
             model=global_settings.openai_model,
-            temperature=0.1,
             messages=[
                 {"role": "system", "content": "Return exact JSON only; no extra text."},
                 {"role": "user", "content": prompt},
             ],
+            reasoning_effort="minimal",
         )
         raw = resp.choices[0].message.content or "[]"
         try:
@@ -181,7 +181,6 @@ Requirement text:
 
         resp = _oai.chat.completions.create(
             model=global_settings.openai_model,
-            temperature=0.2,
             messages=[
                 {
                     "role": "system",
@@ -189,6 +188,7 @@ Requirement text:
                 },
                 {"role": "user", "content": prompt},
             ],
+            reasoning_effort="minimal",
         )
         raw = resp.choices[0].message.content or "{}"
         try:
@@ -196,6 +196,48 @@ Requirement text:
             assert isinstance(tc_obj, dict)
             if "requirement_id" not in tc_obj:
                 raise ValueError("Missing 'requirement_id' in JSON output")
+            # Coerce nested case fields to strings for UI consumption
+            try:
+                cases = tc_obj.get("cases")
+                if isinstance(cases, list):
+                    normalized_cases = []
+                    for c in cases:
+                        if not isinstance(c, dict):
+                            # Represent non-dict entries as a string row
+                            normalized_cases.append({
+                                "type": "info",
+                                "title": str(c),
+                                "preconditions": "",
+                                "steps": str(c),
+                                "expected": ""
+                            })
+                            continue
+                        normalized_case = dict(c)
+                        # Normalize list fields into single strings
+                        for key in ("preconditions", "steps"):
+                            val = normalized_case.get(key)
+                            if isinstance(val, list):
+                                normalized_case[key] = "; ".join(str(x) for x in val)
+                            elif val is None:
+                                normalized_case[key] = ""
+                            else:
+                                normalized_case[key] = str(val)
+                        # Ensure scalar string fields
+                        for key in ("title", "type", "expected"):
+                            val = normalized_case.get(key)
+                            if val is None:
+                                normalized_case[key] = ""
+                            elif not isinstance(val, str):
+                                normalized_case[key] = str(val)
+                        normalized_cases.append(normalized_case)
+                    tc_obj["cases"] = normalized_cases
+                # Ensure top-level strings as well
+                for key in ("requirement_id", "source", "requirement_text"):
+                    if key in tc_obj and not isinstance(tc_obj[key], str):
+                        tc_obj[key] = str(tc_obj[key])
+            except Exception:
+                # If normalization fails, keep original but continue
+                pass
         except Exception as e:
             raise ValueError(f"Invalid JSON from testcase writer: {e}")
 
@@ -212,100 +254,93 @@ Requirement text:
 
         return "Test cases generated successfully"
 
-    def generate_preview_requirements(limit: int = 5) -> Dict[str, Any]:
-        """Create a small preview list of requirements without persisting anything."""
+    def generate_preview(ask: str | None = None) -> str:
+        """Generate a brief, free-form preview of requirements and/or test cases.
+
+        This function:
+        - Reads .txt docs from the suite session directory (fetched via blob storage).
+        - Prompts the model to decide whether to preview requirements, test cases, or both.
+        - Optionally includes a short user ask for additional context.
+        - Returns compact, readable text (no strict JSON required).
+        """
         sdir = SESSIONS_ROOT / suite_id_value
         docs_dir = sdir / "docs"
         blocks = []
         for p in sorted(docs_dir.glob("*.txt")):
-            txt = _read_text(p, max_chars=20_000)
+            txt = _read_text(p, max_chars=12_000)
+            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
+        if not blocks:
+            raise ValueError("No .txt docs in suite.")
+        bundle = "\n\n".join(blocks)
+        user_ask_section = f"\nShort user ask: {ask}\n" if ask else ""
+
+        prompt = f"""
+You are assisting with a SHORT PREVIEW for a test suite.
+
+Guidelines:
+- Decide whether to preview requirements, test cases, or both, based on what seems most helpful.
+- Keep it under ~200 words, easy to skim.
+- If requirements: list a few atomic, verifiable items with brief text and doc names.
+- If test cases: provide a few short titles, 1-3 bullet steps, and expected outcomes.
+- If unsure, include both sections.
+- Do not include large excerpts from the docs.
+
+{user_ask_section}Documents:
+{bundle}
+""".strip()
+
+        resp = _oai.chat.completions.create(
+            model=global_settings.openai_model,
+            messages=[
+                {"role": "system", "content": "Return a compact, readable preview. No code blocks unless necessary."},
+                {"role": "user", "content": prompt},
+            ],
+            reasoning_effort="minimal",
+        )
+        return ask_user(event_type="sample_confirmation", response_to_user=resp.choices[0].message.content)
+
+    def generate_direct_testcases_on_docs(limit_per_doc: int = 6) -> str:
+        """Generate concise test cases directly from the session docs without prior requirement extraction.
+
+        The model should:
+        - Skim each document and propose a handful of high-value test cases.
+        - Include short titles, brief steps (1-5 bullets), and expected outcomes.
+        - Reference source doc names where helpful.
+        - Keep the overall output compact and readable.
+        """
+        sdir = SESSIONS_ROOT / suite_id_value
+        docs_dir = sdir / "docs"
+        blocks = []
+        for p in sorted(docs_dir.glob("*.txt")):
+            txt = _read_text(p, max_chars=16_000)
             blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
         if not blocks:
             raise ValueError("No .txt docs in suite.")
         bundle = "\n\n".join(blocks)
 
         prompt = f"""
-You are a strict requirements extractor creating a SHORT PREVIEW.
-From the provided documents, output up to {limit} atomic, testable requirements.
+You are a QA engineer. Generate concise, high-value TEST CASES directly from the documents below.
 
-Rules:
-- Keep each requirement concise and standalone.
-- Preserve original meaning; do not invent details.
-- Include the source doc name.
-- Use PREVIEW-1..PREVIEW-{limit} as ids.
-
-Return ONLY a JSON array (no markdown):
-[
-  {{"id":"PREVIEW-1","source":"<doc_name>","text":"<requirement>"}}
-]
+Guidelines:
+- No need to extract formal requirements first.
+- For each doc, produce up to {limit_per_doc} short cases.
+- Use short titles, 1-5 bullet steps, and clear expected outcomes.
+- Reference doc names (and sections if obvious) to aid traceability.
+- Keep total length reasonable; focus on actionable, verifiable cases.
 
 Documents:
 {bundle}
 """.strip()
 
-        resp = _oai.chat.completions.create(
+        resp = _oai.chat_completions.create if False else _oai.chat.completions.create(
             model=global_settings.openai_model,
-            temperature=0.1,
             messages=[
-                {"role": "system", "content": "Return exact JSON only; no extra text."},
+                {"role": "system", "content": "Return a compact, readable set of test cases. No unnecessary boilerplate."},
                 {"role": "user", "content": prompt},
             ],
+            reasoning_effort="minimal",
         )
-        raw = resp.choices[0].message.content or "[]"
-        try:
-            preview_reqs = json.loads(raw)
-            assert isinstance(preview_reqs, list)
-        except Exception as e:
-            raise ValueError(f"Invalid JSON from preview requirements: {e}")
-
-        return {"preview_requirements": preview_reqs[:limit]}
-
-    def generate_preview_testcases(requirements: List[Dict[str, Any]], per_req: int = 1) -> Dict[str, Any]:
-        """Create a tiny preview of test cases for provided requirement objects."""
-        if not requirements:
-            return {"samples": []}
-        # Limit total size for cost/latency
-        reqs_limited = requirements[: min(len(requirements), 3)]
-
-        req_bundle_lines = []
-        for r in reqs_limited:
-            rid = r.get("id", "PREVIEW")
-            src = r.get("source", "unknown.txt")
-            txt = r.get("text", "")
-            req_bundle_lines.append(f"ID: {rid}\nSOURCE: {src}\nTEXT: {txt}")
-        req_bundle = "\n\n".join(req_bundle_lines)
-
-        prompt = f"""
-You are a precise QA engineer creating a SHORT PREVIEW of test cases.
-For each requirement below, produce {per_req} concise case.
-
-Return ONLY a JSON object (no markdown):
-{{
-  "samples": [
-    {{"requirement_id": "<id>", "cases": [{{"type": "preview", "title": "<short>", "steps": ["..."], "expected": "..."}}]}}
-  ]
-}}
-
-Requirements:
-{req_bundle}
-""".strip()
-
-        resp = _oai.chat.completions.create(
-            model=global_settings.openai_model,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": "Return exact JSON only; no extra text."},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        raw = resp.choices[0].message.content or "{}"
-        try:
-            samples_obj = json.loads(raw)
-            assert isinstance(samples_obj, dict)
-        except Exception as e:
-            raise ValueError(f"Invalid JSON from preview testcases: {e}")
-
-        return samples_obj
+        return resp.choices[0].message.content or ""
 
     def ask_user(event_type: str, response_to_user: str) -> Dict[str, Any]:
         """Log a user-facing question to events and terminate the flow.
@@ -316,7 +351,7 @@ Requirements:
 
         Returns a payload that includes the token "TERMINATE" to trigger termination.
         """
-        allowed_types = {"sample_confirmation"}
+        allowed_types = {"sample_confirmation", "quality_confirmation", "requirements_feedback", "requirements_sample_offer", "testcases_sample_offer"}
         if event_type not in allowed_types:
             raise ValueError(f"Unsupported event_type: {event_type}")
 
@@ -345,25 +380,182 @@ Requirements:
             "event": event_payload,
         }
 
+    def get_requirements_info(question: str) -> Any:
+        """Answer a user question about this suite's requirements.
+
+        - Loads cached requirements if present, otherwise queries the DB.
+        - If none exist, prompt the user to generate them (ask_user flow).
+        - Uses the LLM to answer concisely and cite relevant requirement IDs.
+        """
+        # Try in-memory cache first
+        reqs = _SUITE_REQUIREMENTS.get(suite_id_value)
+        # If not cached, query DB (best-effort)
+        if not reqs:
+            try:
+                data = (
+                    supabase_client
+                    .table("requirements")
+                    .select("content")
+                    .eq("suite_id", suite_id_value)
+                    .execute()
+                    .data
+                    or []
+                )
+                reqs = [row.get("content") for row in data if isinstance(row.get("content"), dict)]
+            except Exception:
+                reqs = []
+
+        # If none exist, ask the user whether to generate requirements now
+        if not reqs:
+            return ask_user(
+                event_type="requirements_sample_offer",
+                response_to_user=(
+                    "No requirements found for this suite.\n\n"
+                    "Actions:\n"
+                    "- Generate Requirements Sample (preview a few extracted items)\n"
+                    "- Or upload/fetch docs first."
+                ),
+            )
+
+        # Use LLM to answer based on current requirements
+        try:
+            brief_list = [
+                {
+                    "id": r.get("id"),
+                    "source": r.get("source"),
+                    "text": r.get("text"),
+                }
+                for r in reqs
+                if isinstance(r, dict)
+            ]
+            context_str = json.dumps(brief_list, ensure_ascii=False)
+            if len(context_str) > 8000:
+                context_str = context_str[:8000] + "\n...truncated..."
+
+            prompt = (
+                "You are answering a question about a set of software requirements.\n"
+                "- Cite relevant requirement IDs like REQ-1, REQ-2 in your answer.\n"
+                "- If the answer is not present in the requirements, say 'Not found in requirements'.\n"
+                "- Be concise.\n\n"
+                f"Requirements JSON:\n{context_str}\n\n"
+                f"Question:\n{question}"
+            )
+            resp = _oai.chat.completions.create(
+                model=global_settings.openai_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Answer concisely based only on the provided requirements.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                reasoning_effort="minimal",
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            return f"Error answering about requirements: {e}"
+
+    def get_testcases_info(question: str) -> Any:
+        """Answer a user question about this suite's generated test cases.
+
+        - Queries the DB for all test cases for this suite (best-effort).
+        - If none exist, prompt the user to generate them (ask_user flow).
+        - Uses the LLM to answer concisely and reference requirement IDs where applicable.
+        """
+        testcases: List[Dict[str, Any]] = []
+        try:
+            data = (
+                supabase_client
+                .table("test_cases")
+                .select("content")
+                .eq("suite_id", suite_id_value)
+                .execute()
+                .data
+                or []
+            )
+            testcases = [row.get("content") for row in data if isinstance(row.get("content"), dict)]
+        except Exception:
+            testcases = []
+
+        if not testcases:
+            return ask_user(
+                event_type="testcases_sample_offer",
+                response_to_user=(
+                    "No test cases found for this suite.\n\n"
+                    "Actions:\n"
+                    "- Generate Test Cases Sample (preview a few cases)\n"
+                    "- Or extract requirements first for better quality."
+                ),
+            )
+
+        try:
+            compact_cases: List[Dict[str, Any]] = []
+            for tc in testcases:
+                rid = tc.get("requirement_id")
+                src = tc.get("source")
+                cases = tc.get("cases") or []
+                for c in cases:
+                    if not isinstance(c, dict):
+                        continue
+                    compact_cases.append(
+                        {
+                            "requirement_id": rid,
+                            "source": src,
+                            "type": c.get("type"),
+                            "title": c.get("title"),
+                            "expected": c.get("expected"),
+                        }
+                    )
+
+            context_str = json.dumps(compact_cases, ensure_ascii=False)
+            if len(context_str) > 8000:
+                context_str = context_str[:8000] + "\n...truncated..."
+
+            prompt = (
+                "You are answering a question about generated QA test cases.\n"
+                "- Reference requirement IDs and case titles/types where relevant.\n"
+                "- If the answer is not present, say 'Not found in test cases'.\n"
+                "- Be concise.\n\n"
+                f"Test cases JSON:\n{context_str}\n\n"
+                f"Question:\n{question}"
+            )
+            resp = _oai.chat.completions.create(
+                model=global_settings.openai_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Answer concisely based only on the provided test cases.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                reasoning_effort="minimal",
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            return f"Error answering about test cases: {e}"
+
     # Build per-suite agents with closure-bound tools
     planner_local = AssistantAgent(
         "planner",
         model_client=model_client,
         handoffs=["fetcher", "requirements_extractor", "testcase_writer"],
-        tools=[generate_preview_requirements, generate_preview_testcases, ask_user],
+        tools=[generate_preview, ask_user, get_requirements_info, get_testcases_info],
         system_message=(
             "You are the planner. Keep outputs tiny.\n"
-            "Decision:\n"
-            "- Do a preview flow:\n"
-            "  1) Parse user input for doc names.\n"
-            "  2) Handoff to fetcher with the names.\n"
-            "  3) Call generate_preview_requirements(limit=5).\n"
-            "  4) Call generate_preview_testcases(requirements=<from step 3>, per_req=1).\n"
-            "  5) Return a compact preview: a few requirement ids+texts, and one preview testcase per requirement.\n"
-            "  6) Call ask_user(event_type=\"sample_confirmation\", response_to_user=\"<1-2 lines>\") to request confirmation; this writes an event\n"
-            "  7) If the user confirms, handoff to requirements_extractor, then testcase_writer, then summarize and write the word TERMINATE to end.\n"
-            # "  8) If the user does not confirm, return the preview and TERMINATE.\n"
-            "Never paste large content."
+            "Flow:\n"
+            "  1) Parse doc names from the user's message.\n"
+            "  2) Handoff to fetcher to load the docs.\n"
+            "  4) Decide the path based on the user's original intent:\n"
+            "     - If the ask requested to generate test cases from the document straight away:\n"
+            "       You must ask for a quality choice via ask_user(event_type=\\\"quality_confirmation\\\", response_to_user=\\\"Extract requirements first for better quality?\\\").\n"
+            "       On the next reply: if it's 'Yes please', handoff to requirements_extractor. If it's 'CONTINUE', handoff to testcase_writer to generate cases directly from docs.\n"
+            "     - Otherwise (no explicit direct test-case request): handoff to requirements_extractor by default.\n"
+            "  5) After requirements_extractor finishes, it will ask ask_user(event_type=\\\"requirements_feedback\\\"). Wait for the next user reply.\n"
+            "     If the reply is 'CONTINUE', handoff to testcase_writer to generate full test cases; then summarize and write TERMINATE.\n"
+            "     If the reply indicates changes or hesitation (anything other than 'CONTINUE'), respond briefly and write TERMINATE.\n"
+            "  6) After testcase_writer finishes, respond briefly with a bit of content and the word TERMINATE\n"
+            "Notes: Before handing off to requirements_extractor or testcase_writer, you must run generate_preview tool first then ask user for feedback through ask_user sample_confirmation. This should be after any quality_confirmation of course.\n"
+            "If the user asks questions about existing requirements or test cases, use get_requirements_info(question=...) or get_testcases_info(question=...) to answer conciesly then write TERMINATE\n"
         ),
     )
 
@@ -383,11 +575,13 @@ Requirements:
         "requirements_extractor",
         model_client=model_client,
         handoffs=["testcase_writer", "planner"],
-        tools=[extract_and_store_requirements],
+        tools=[extract_and_store_requirements, ask_user],
         system_message=(
             "Call extract_and_store_requirements().\n"
             "Reply only: requirements_artifact.\n"
-            "Then handoff to testcase_writer."
+            "Then call ask_user(event_type=\"requirements_feedback\", response_to_user=\"Requirements extracted. Proceed to generate test cases now?\") to request confirmation; this writes an event and TERMINATE.\n"
+            "After every ask_user(...) call, immediately transfer back to planner (handoff to planner).\n"
+            "If the user asks about requirements or test cases information at any time, do not answer; handoff to planner so it can respond using its info tools."
         ),
     )
 
@@ -395,12 +589,13 @@ Requirements:
         "testcase_writer",
         model_client=model_client,
         handoffs=["planner"],
-        tools=[list_requirement_ids, generate_and_store_testcases_for_req],
+        tools=[list_requirement_ids, generate_and_store_testcases_for_req, generate_direct_testcases_on_docs],
         system_message=(
-            "1) Call list_requirement_ids() to get only IDs.\n"
+            "If asked to generate test cases directly from docs, you must call generate_direct_testcases_on_docs() then transfer back to planner\n"
+            "Otherwise: 1) Call list_requirement_ids() to get only IDs.\n"
             "2) For each id, call generate_and_store_testcases_for_req(req_id).\n"
-            "Do not inline any test content.\n"
-            "Then handoff to planner."
+            "Then handoff back to the planner.\n"
+            "If the user asks about test cases or requirements information, do not answer; handoff to planner so it can respond using its info tools."
         ),
     )
 
@@ -422,6 +617,7 @@ model_client = OpenAIChatCompletionClient(
     model=global_settings.openai_model,
     parallel_tool_calls=False,
     api_key=global_settings.openai_api_key,
+    reasoning_effort = "minimal"
 )
 
 # Global termination condition
@@ -445,6 +641,12 @@ def _get_suite_agent_state(suite_id: Optional[str]) -> Optional[Dict[str, Any]]:
 async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: Optional[str] = None):
     _message_id = message_id or str(uuid4())
     local_team = make_team_for_suite(suite_id, message_id)
+    # Mark suite as chatting/running (best-effort)
+    try:
+        if suite_id:
+            supabase_client.table("test_suites").update({"status": "chatting"}).eq("id", suite_id).execute()
+    except Exception as e:
+        print(e)
     # Best-effort: load prior team state if the suite exists and has stored state
     try:
         prior_state = _get_suite_agent_state(suite_id)
@@ -468,6 +670,12 @@ async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: 
         yield event
 
     _results_writer.write_suite_state(suite_id=suite_id, state=await local_team.save_state())
+    # Back to idle when finished (best-effort)
+    try:
+        if suite_id:
+            supabase_client.table("test_suites").update({"status": "idle"}).eq("id", suite_id).execute()
+    except Exception as e:
+        print(f"Error updating suite status to idle: {e}")
 
 
 # -----------------------------
