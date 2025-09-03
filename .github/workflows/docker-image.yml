@@ -1,0 +1,28 @@
+name: Build and Push Image
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: <your-registry-name>.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and Push Docker image
+        run: |
+          IMAGE_NAME=agentic-tester-back
+          COMMIT_HASH=${GITHUB_SHA}   # full commit hash
+          docker build -t <your-registry-name>.azurecr.io/$IMAGE_NAME:$COMMIT_HASH .
+          docker push <your-registry-name>.azurecr.io/$IMAGE_NAME:$COMMIT_HASH
