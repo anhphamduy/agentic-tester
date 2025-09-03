@@ -150,7 +150,15 @@ export function ChatPanel({
       {/* Messages */}
       <ScrollArea className="flex-1 p-4">
         <div className="space-y-4">
-          {messages.length === 0 && <div className="text-center text-muted-foreground py-8">
+          {(() => {
+            // Hide empty placeholder messages (e.g., pending AI response) while still
+            // showing special interactive message types like selection chips
+            const visibleMessages = (messages || []).filter(m => {
+              if (m?.type === "artifact-selection" || m?.type === "next-step") return true;
+              return Boolean((m?.content || "").trim());
+            });
+            return visibleMessages.length === 0;
+          })() && <div className="text-center text-muted-foreground py-8">
               <Logo className="mx-auto mb-4" size="lg" iconOnly />
               <p className="text-lg font-medium">Welcome to TestVista</p>
               <p className="text-sm">Start by uploading requirements or asking me to generate test cases</p>
@@ -164,7 +172,10 @@ export function ChatPanel({
               </div>
             </div>}
 
-          {messages.map((message, idx) => <div key={message.id} className={cn("flex gap-3", message.role === "user" ? "justify-end" : "justify-start")}>
+          {(messages || []).filter(message => {
+            if (message?.type === "artifact-selection" || message?.type === "next-step") return true;
+            return Boolean((message?.content || "").trim());
+          }).map((message, idx) => <div key={message.id} className={cn("flex gap-3", message.role === "user" ? "justify-end" : "justify-start")}>
               {message.role === "ai" && <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
                   <Logo size="sm" iconOnly />
                 </div>}

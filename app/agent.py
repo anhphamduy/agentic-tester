@@ -254,13 +254,238 @@ Requirement text:
 
         return "Test cases generated successfully"
 
-    def generate_preview(ask: str | None = None) -> str:
+    def edit_testcases_for_req(req_id: str, user_edit_request: str) -> Dict[str, Any]:
+        """Edit existing test cases for a requirement, produce LLM diff, and persist a new version.
+
+        Behavior:
+        - Fetch the requirement row by (suite_id, req_code) and the latest test_cases by requirement_id.
+        - Ask the LLM to compute structured diffs (added, removed, edited) and return a full updated "new_testcases" JSON.
+        - Clone by inserting a new row in test_cases with an incremented version (if column exists), else update in place as fallback.
+        - Always include the computed version inside content as a top-level field "version" for robustness with dynamic schemas.
+        - Return a compact payload including the diff and version info.
+        """
+        # Resolve requirement row
+        try:
+            req_rows = (
+                supabase_client
+                .table("requirements")
+                .select("id, content, source_doc")
+                .eq("suite_id", suite_id_value)
+                .eq("req_code", req_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if not req_rows:
+                raise ValueError(f"Requirement row not found for req_code={req_id}")
+            requirement_row = req_rows[0]
+            requirement_id = requirement_row.get("id")
+            requirement_content = requirement_row.get("content") or {}
+        except Exception as e:
+            raise ValueError(f"Failed to resolve requirement {req_id}: {e}")
+
+        # Fetch latest existing test cases for this requirement
+        existing_tc_row = None
+        latest_version = None
+        try:
+            # Prefer versioned ordering if column exists
+            existing_tc_rows = (
+                supabase_client
+                .table("test_cases")
+                .select("id, content, version, suite_id")
+                .eq("requirement_id", requirement_id)
+                .order("version", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if existing_tc_rows:
+                existing_tc_row = existing_tc_rows[0]
+                latest_version = existing_tc_row.get("version")
+        except Exception:
+            # Fallback for pre-migration schema without version column
+            try:
+                existing_tc_rows = (
+                    supabase_client
+                    .table("test_cases")
+                    .select("id, content, suite_id")
+                    .eq("requirement_id", requirement_id)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+                if existing_tc_rows:
+                    existing_tc_row = existing_tc_rows[0]
+            except Exception:
+                existing_tc_row = None
+
+        old_testcases = (existing_tc_row or {}).get("content") or {}
+
+        # Prepare LLM prompt for diffing with dynamic schema
+        requirement_text = ""
+        try:
+            requirement_text = str((requirement_content or {}).get("text") or "")
+        except Exception:
+            requirement_text = ""
+
+        prompt = (
+            "You are a QA assistant. You will update an existing set of test cases based on a user edit request.\n"
+            "- The test cases JSON schema may be dynamic; preserve unknown fields and structure.\n"
+            "- Compute a precise diff and also return the full updated test cases JSON.\n\n"
+            "Return ONLY strict JSON with this shape (no markdown):\n"
+            "{\n"
+            "  \"diff\": {\n"
+            "    \"added\": [<JSON of newly added test case objects>],\n"
+            "    \"removed\": [<JSON of removed test case objects or identifiers>],\n"
+            "    \"edited\": [{\n"
+            "      \"before\": <JSON of original case>,\n"
+            "      \"after\": <JSON of updated case>,\n"
+            "      \"change_note\": \"<short note>\"\n"
+            "    }]\n"
+            "  },\n"
+            "  \"new_testcases\": <FULL JSON of the updated test cases>,\n"
+            "  \"summary\": \"<1-2 sentences>\"\n"
+            "}\n\n"
+            "Guidelines:\n"
+            "- When matching cases, prefer stable keys like id, title, or type+title; if absent, match by closest content.\n"
+            "- Keep steps/preconditions formatting consistent.\n"
+            "- Do not invent fields not present unless required by the structure.\n"
+            "- Always include new_testcases as the authoritative updated artifact.\n\n"
+            f"Linked Requirement Text (for context):\n{requirement_text}\n\n"
+            f"Existing Test Cases JSON:\n{json.dumps(old_testcases, ensure_ascii=False)}\n\n"
+            f"User Edit Request:\n{user_edit_request}\n"
+        )
+
+        try:
+            resp = _oai.chat.completions.create(
+                model=global_settings.openai_model,
+                messages=[
+                    {"role": "system", "content": "Return strict JSON only; no extra text."},
+                    {"role": "user", "content": prompt},
+                ],
+                reasoning_effort="minimal",
+            )
+            raw = resp.choices[0].message.content or "{}"
+            llm_out = json.loads(raw)
+        except Exception as e:
+            raise ValueError(f"Invalid JSON from edit diff generator: {e}")
+
+        diff = llm_out.get("diff") or {}
+        new_testcases = llm_out.get("new_testcases") or old_testcases
+        summary = llm_out.get("summary") or ""
+
+        # Decide next version
+        try:
+            prev_version_val = int(latest_version) if latest_version is not None else None
+        except Exception:
+            prev_version_val = None
+        next_version = (prev_version_val or 1) + 1 if existing_tc_row else 1
+
+        # Ensure the content itself carries a version hint for robustness with dynamic schemas
+        if isinstance(new_testcases, dict) and "version" not in new_testcases:
+            try:
+                new_testcases_with_meta = dict(new_testcases)
+                new_testcases_with_meta["version"] = next_version
+                new_testcases = new_testcases_with_meta
+            except Exception:
+                pass
+
+        # Persist: insert a new versioned row if possible; fallback to update in place
+        inserted_row_id: Optional[str] = None
+        try:
+            # Try versioned insert
+            insert_payload = {
+                "requirement_id": requirement_id,
+                "suite_id": suite_id_value,
+                "content": new_testcases,
+                "version": next_version,
+            }
+            res = (
+                supabase_client
+                .table("test_cases")
+                .insert(insert_payload)
+                .execute()
+            )
+            try:
+                inserted_row_id = ((res.data or [])[0] or {}).get("id")
+            except Exception:
+                inserted_row_id = None
+        except Exception:
+            # Fallback: update existing row in place (pre-migration), if any; else insert without version
+            try:
+                if existing_tc_row and existing_tc_row.get("id"):
+                    supabase_client.table("test_cases").update({
+                        "content": new_testcases,
+                        "suite_id": suite_id_value,
+                    }).eq("id", existing_tc_row.get("id")).execute()
+                    inserted_row_id = existing_tc_row.get("id")
+                else:
+                    res2 = (
+                        supabase_client
+                        .table("test_cases")
+                        .insert({
+                            "requirement_id": requirement_id,
+                            "suite_id": suite_id_value,
+                            "content": new_testcases,
+                        })
+                        .execute()
+                    )
+                    try:
+                        inserted_row_id = ((res2.data or [])[0] or {}).get("id")
+                    except Exception:
+                        inserted_row_id = None
+            except Exception:
+                # Last-resort: swallow persistence failure to avoid breaking the flow
+                pass
+
+        # Emit an event for auditability (best-effort) and for user-facing display
+        try:
+            _results_writer.write_event(
+                suite_id=suite_id_value,
+                event={
+                    "type": "testcases_edited",
+                    "suite_id": suite_id_value,
+                    "req_code": req_id,
+                    "requirement_id": requirement_id,
+                    "user_edit_request": user_edit_request,
+                    "old_version": prev_version_val or (1 if existing_tc_row else 0),
+                    "new_version": next_version,
+                    "diff": diff,
+                    "new_testcases": new_testcases,
+                    "summary": summary,
+                    "row_id": inserted_row_id,
+                },
+                message_id=message_id,
+            )
+        except Exception:
+            pass
+
+        return {
+            "requirement_id": requirement_id,
+            "req_code": req_id,
+            "old_version": prev_version_val or (1 if existing_tc_row else 0),
+            "new_version": next_version,
+            "diff": diff,
+            "new_testcases": new_testcases,
+            "user_edit_request": user_edit_request,
+            "summary": summary,
+            "status": "ok",
+        }
+
+    def generate_preview(ask: str | None = None, preview_mode: Optional[str] = None) -> str:
         """Generate a brief, free-form preview of requirements and/or test cases.
 
-        This function:
+        Parameters:
+        - ask: Optional short user ask for additional context.
+        - preview_mode: "requirements" | "testcases" | None. If provided, the preview
+          will focus ONLY on the specified type. If None, the model decides what is most helpful.
+
+        Behavior:
         - Reads .txt docs from the suite session directory (fetched via blob storage).
-        - Prompts the model to decide whether to preview requirements, test cases, or both.
-        - Optionally includes a short user ask for additional context.
+        - Adjusts prompt guidelines based on preview_mode.
         - Returns compact, readable text (no strict JSON required).
         """
         sdir = SESSIONS_ROOT / suite_id_value
@@ -274,15 +499,31 @@ Requirement text:
         bundle = "\n\n".join(blocks)
         user_ask_section = f"\nShort user ask: {ask}\n" if ask else ""
 
+        mode = (preview_mode or "").strip().lower()
+        if mode == "requirements":
+            guidelines = (
+                "- Preview REQUIREMENTS ONLY.\n"
+                "- List a few atomic, verifiable items with brief text and doc names."
+            )
+        elif mode == "testcases":
+            guidelines = (
+                "- Preview TEST CASES ONLY.\n"
+                "- Provide a few short titles, 1-3 bullet steps, and expected outcomes.\n"
+                "- Reference source doc names where helpful."
+            )
+        else:
+            guidelines = (
+                "- Decide whether to preview requirements, test cases, or both, based on what seems most helpful.\n"
+                "- If requirements: list a few atomic, verifiable items with brief text and doc names.\n"
+                "- If test cases: provide a few short titles, 1-3 bullet steps, and expected outcomes."
+            )
+
         prompt = f"""
 You are assisting with a SHORT PREVIEW for a test suite.
 
 Guidelines:
-- Decide whether to preview requirements, test cases, or both, based on what seems most helpful.
+{guidelines}
 - Keep it under ~200 words, easy to skim.
-- If requirements: list a few atomic, verifiable items with brief text and doc names.
-- If test cases: provide a few short titles, 1-3 bullet steps, and expected outcomes.
-- If unsure, include both sections.
 - Do not include large excerpts from the docs.
 
 {user_ask_section}Documents:
@@ -341,6 +582,95 @@ Documents:
             reasoning_effort="minimal",
         )
         return resp.choices[0].message.content or ""
+
+    def identify_gaps(testing_type: Optional[str] = None) -> str:
+        """Analyze fetched documents to identify requirement/test gaps or ambiguities.
+
+        Behavior:
+        - Reads .txt docs from the suite session directory (already fetched by fetcher).
+        - Uses the model to identify missing requirements, ambiguities, conflicts, and test coverage gaps.
+        - Returns a SHORT human-readable summary.
+        - IMPORTANT: If any gaps are found, the returned text MUST include the token 'TERMINATE'
+          so the global termination condition ends the run immediately.
+        """
+        sdir = SESSIONS_ROOT / suite_id_value
+        docs_dir = sdir / "docs"
+        blocks = []
+        for p in sorted(docs_dir.glob("*.txt")):
+            txt = _read_text(p, max_chars=12_000)
+            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
+        if not blocks:
+            # No docs → no gaps can be assessed
+            return "No documents available for gap analysis."
+        bundle = "\n\n".join(blocks)
+
+        normalized_type = (testing_type or "").strip().lower() or None
+        type_hint = ""
+        if normalized_type in {"unit", "integration", "system"}:
+            type_hint = f"\n\nUser testing focus: {normalized_type} testing. Adjust the gaps and recommendations to emphasize {normalized_type}-testing concerns."
+
+        prompt = f"""
+You are a QA analyst. Based ONLY on the documents, identify gaps that would block clean requirements and testing.
+
+Return ONLY JSON (no markdown):
+{{
+  "has_gaps": <true|false>,
+  "gaps": ["<concise gap/ambiguity/assumption>", "..."] ,
+  "recommendations": ["<short action>", "..."],
+  "testing_type_needed": <true|false>,
+  "testing_type_options": ["unit", "integration", "system"],
+  "follow_up": "<if testing_type_needed is true, ask user to choose unit, integration, or system>"
+}}
+
+Consider: missing acceptance criteria, undefined terms, conflicting statements, non-testable language, unclear boundaries, missing error handling, and data/role/permission gaps.
+
+Documents:
+{bundle}
+{type_hint}
+""".strip()
+
+        try:
+            resp = _oai.chat.completions.create(
+                model=global_settings.openai_model,
+                messages=[
+                    {"role": "system", "content": "Return strict JSON only; no extra text."},
+                    {"role": "user", "content": prompt},
+                ],
+                reasoning_effort="minimal",
+            )
+            raw = resp.choices[0].message.content or "{}"
+            data = json.loads(raw)
+            has_gaps = bool(data.get("has_gaps"))
+            gaps = data.get("gaps") or []
+            recs = data.get("recommendations") or []
+            testing_type_needed = bool(data.get("testing_type_needed"))
+            follow_up = data.get("follow_up") or ""
+            if not isinstance(gaps, list):
+                gaps = [str(gaps)]
+            if not isinstance(recs, list):
+                recs = [str(recs)]
+
+            if has_gaps and gaps:
+                lines = ["Gap analysis results:"]
+                for g in gaps[:10]:
+                    lines.append(f"- {str(g)}")
+                if recs:
+                    lines.append("\nRecommended actions:")
+                    for r in recs[:10]:
+                        lines.append(f"- {str(r)}")
+                if testing_type_needed:
+                    lines.append("\nAdditional info needed:")
+                    lines.append(f"- {follow_up or 'Please choose a testing focus: Unit testing, Integration testing, or System testing.'}")
+                # Append TERMINATE so the run stops per termination condition
+                lines.append("\nTERMINATE")
+                return "\n".join(lines)
+            else:
+                if testing_type_needed:
+                    msg = follow_up or "Please choose a testing focus: Unit testing, Integration testing, or System testing."
+                    return msg
+                return "No significant gaps detected in documents."
+        except Exception as e:
+            return f"Gap analysis error: {e}"
 
     def ask_user(event_type: str, response_to_user: str) -> Dict[str, Any]:
         """Log a user-facing question to events and terminate the flow.
@@ -539,7 +869,7 @@ Documents:
         "planner",
         model_client=model_client,
         handoffs=["fetcher", "requirements_extractor", "testcase_writer"],
-        tools=[generate_preview, ask_user, get_requirements_info, get_testcases_info],
+        tools=[generate_preview, ask_user, get_requirements_info, get_testcases_info, identify_gaps],
         system_message=(
             "You are the planner. Keep outputs tiny.\n"
             "Flow:\n"
@@ -550,12 +880,19 @@ Documents:
             "       You must ask for a quality choice via ask_user(event_type=\\\"quality_confirmation\\\", response_to_user=\\\"Extract requirements first for better quality?\\\").\n"
             "       On the next reply: if it's 'Yes please', handoff to requirements_extractor. If it's 'CONTINUE', handoff to testcase_writer to generate cases directly from docs.\n"
             "     - Otherwise (no explicit direct test-case request): handoff to requirements_extractor by default.\n"
+            "     - If the user's request is to EDIT or UPDATE existing test cases (phrases like 'edit', 'update', 'revise', 'modify', 'tweak steps/titles/expected'):\n"
+            "       Immediately handoff to testcase_writer to run edit_testcases_for_req(req_id, user_edit_request).\n"
+            "       If req_id is not in the message, ask the user to specify the requirement ID and the requested change using ask_user(event_type=\\\"sample_confirmation\\\", response_to_user=\\\"Please provide the requirement ID (e.g., REQ-3) and a brief edit request.\\\").\n"
             "  5) After requirements_extractor finishes, it will ask ask_user(event_type=\\\"requirements_feedback\\\"). Wait for the next user reply.\n"
             "     If the reply is 'CONTINUE', handoff to testcase_writer to generate full test cases; then summarize and write TERMINATE.\n"
             "     If the reply indicates changes or hesitation (anything other than 'CONTINUE'), respond briefly and write TERMINATE.\n"
             "  6) After testcase_writer finishes, respond briefly with a bit of content and the word TERMINATE\n"
-            "Notes: Before handing off to requirements_extractor or testcase_writer, you must run generate_preview tool first then ask user for feedback through ask_user sample_confirmation. This should be after any quality_confirmation of course.\n"
-            "If the user asks questions about existing requirements or test cases, use get_requirements_info(question=...) or get_testcases_info(question=...) to answer conciesly then write TERMINATE\n"
+            "Notes: After fetcher loads the documents, RUN identify_gaps(). If gaps are found, you must return a short summary that includes the word TERMINATE to end the flow. If no gaps, proceed.\n"
+            "Also: Before handing off to requirements_extractor or testcase_writer, run generate_preview then ask_user sample_confirmation (after any quality_confirmation).\n"
+            "Always confirm immediate next steps with the user via ask_user BEFORE proceeding, EXCEPT when the user explicitly requests to edit test cases—then handoff directly to testcase_writer. For example: ask_user(event_type=\"quality_confirmation\", response_to_user=\"Should I extract requirements first for easier tracking before generating test cases?\").\n"
+            "If the user has specified a testing focus (e.g., unit or integration), call identify_gaps(testing_type=...). If not, identify_gaps will include 'testing_type_needed' and a follow-up prompt in its JSON/text output.\n"
+            "If the user asks questions about existing requirements or test cases, use get_requirements_info(question=...) or get_testcases_info(question=...) to answer conciesly then write TERMINATE.\n"
+            "If the user asks to edit test cases, do not answer directly; handoff to testcase_writer.\n"
         ),
     )
 
@@ -589,11 +926,12 @@ Documents:
         "testcase_writer",
         model_client=model_client,
         handoffs=["planner"],
-        tools=[list_requirement_ids, generate_and_store_testcases_for_req, generate_direct_testcases_on_docs],
+        tools=[list_requirement_ids, generate_and_store_testcases_for_req, generate_direct_testcases_on_docs, edit_testcases_for_req],
         system_message=(
             "If asked to generate test cases directly from docs, you must call generate_direct_testcases_on_docs() then transfer back to planner\n"
             "Otherwise: 1) Call list_requirement_ids() to get only IDs.\n"
             "2) For each id, call generate_and_store_testcases_for_req(req_id).\n"
+            "If asked to edit test cases for a specific requirement, call edit_testcases_for_req(req_id, user_edit_request) which computes diffs and persists a new version.\n"
             "Then handoff back to the planner.\n"
             "If the user asks about test cases or requirements information, do not answer; handoff to planner so it can respond using its info tools."
         ),

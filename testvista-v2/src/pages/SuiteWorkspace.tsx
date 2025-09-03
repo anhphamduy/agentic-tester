@@ -3,7 +3,7 @@ import { supabase } from "@/supabase_client";
 import { ChatPanel } from "@/components/suite/chat-panel";
 import { ArtifactsPanel } from "@/components/suite/artifacts-panel";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, Play, Pause, RotateCcw } from "lucide-react";
+import { ArrowLeft, Play, Pause, RotateCcw, Loader2 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
@@ -114,11 +114,13 @@ export default function SuiteWorkspace() {
   const [dynamicRequirementsRows, setDynamicRequirementsRows] = useState<any[]>([]);
   const [dynamicTestCaseRows, setDynamicTestCaseRows] = useState<any[]>([]);
   const [agentLoading, setAgentLoading] = useState(false);
+  const [initialChatLoading, setInitialChatLoading] = useState(true);
   const loadTeamEvents = async () => {
     try {
+      setInitialChatLoading(true);
       const suiteIdParam = new URLSearchParams(window.location.search).get('suiteId');
       const suiteIdVal = id || suiteIdParam || undefined;
-      if (!suiteIdVal) return;
+      if (!suiteIdVal) { setInitialChatLoading(false); return; }
       const { data, error } = await supabase
         .from('team_events')
         .select('*')
@@ -190,8 +192,10 @@ export default function SuiteWorkspace() {
       });
 
       setMessages(result);
+      setInitialChatLoading(false);
     } catch (e) {
       console.error('Failed to load team events', e);
+      setInitialChatLoading(false);
     }
   };
   const [selectedArtifact, setSelectedArtifact] = useState<{
@@ -235,7 +239,9 @@ export default function SuiteWorkspace() {
       return (text || '')
         .replace(/\\r\\n/g, '\n')
         .replace(/\\n/g, '\n')
-        .replace(/\\t/g, '  ');
+        .replace(/\\t/g, '  ')
+        // Strip a trailing TERMINATE token (case-insensitive) if present at the end
+        .replace(/\s*TERMINATE\s*$/i, '');
     } catch {
       return text;
     }
@@ -318,6 +324,15 @@ export default function SuiteWorkspace() {
       if (source === 'planner' && name === 'generate_preview') {
         return { role: 'ai', content: `I'm generating a short preview...` };
       }
+      if (source === 'planner' && name === 'identify_gaps') {
+        let focus = '';
+        try {
+          const args = first?.arguments ? JSON.parse(first.arguments) : {};
+          const t = typeof args?.testing_type === 'string' ? args.testing_type : '';
+          if (t) focus = ` with a ${t} testing focus`;
+        } catch {}
+        return { role: 'ai', content: `I'm analyzing your documents to identify gaps and ambiguities${focus}...` };
+      }
       if (source === 'planner' && name === 'get_requirements_info') {
         return { role: 'ai', content: `I'm checking existing requirements and answering your question...` };
       }
@@ -380,6 +395,11 @@ export default function SuiteWorkspace() {
       if (source === 'planner' && name === 'generate_preview') {
         const details = normalizeMarkdown(String(first?.content ?? ''));
         return { role: 'ai', content: details || 'Preview generated.' };
+      }
+      if (source === 'planner' && name === 'identify_gaps') {
+        const detailsRaw = String(first?.content ?? '');
+        const details = normalizeMarkdown(detailsRaw).replace(/\bTERMINATE\b/g, '').trim();
+        return { role: 'ai', content: details || 'No significant gaps detected.' };
       }
       if (source === 'planner' && name === 'get_requirements_info') {
         const details = normalizeMarkdown(String(first?.content ?? ''));
@@ -1431,7 +1451,7 @@ export default function SuiteWorkspace() {
       {/* Main Content - Split Screen */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left Panel - Chat */}
-        <div className="w-1/3 min-w-[400px] max-w-[500px] h-full">
+        <div className="relative w-1/3 min-w-[400px] max-w-[500px] h-full">
           <ChatPanel 
             messages={messages} 
             onSendMessage={handleSendMessage} 
@@ -1441,6 +1461,11 @@ export default function SuiteWorkspace() {
             onViewHistory={() => setShowVersionHistory(true)}
             uploadedFiles={uploadedFiles}
           />
+          {initialChatLoading && (
+            <div className="absolute inset-0 flex items-center justify-center bg-background/70 z-10">
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+            </div>
+          )}
         </div>
 
         {/* Right Panel - Artifacts */}

@@ -69,7 +69,7 @@ export function CreateSuiteModal({
                 value={suiteName}
                 onChange={(e) => setSuiteName(e.target.value)}
                 autoFocus
-                className="focus:border-primary/50"
+                className="focus:border-primary focus-visible:ring-0 focus-visible:ring-offset-0"
               />
             </div>
 
