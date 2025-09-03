@@ -115,12 +115,13 @@ export default function SuiteWorkspace() {
   const [dynamicTestCaseRows, setDynamicTestCaseRows] = useState<any[]>([]);
   const [agentLoading, setAgentLoading] = useState(false);
   const [initialChatLoading, setInitialChatLoading] = useState(true);
+  const hasLoadedChatOnce = useRef(false);
   const loadTeamEvents = async () => {
     try {
-      setInitialChatLoading(true);
+      if (!hasLoadedChatOnce.current) setInitialChatLoading(true);
       const suiteIdParam = new URLSearchParams(window.location.search).get('suiteId');
       const suiteIdVal = id || suiteIdParam || undefined;
-      if (!suiteIdVal) { setInitialChatLoading(false); return; }
+      if (!suiteIdVal) { setInitialChatLoading(false); hasLoadedChatOnce.current = true; return; }
       const { data, error } = await supabase
         .from('team_events')
         .select('*')
@@ -193,9 +194,11 @@ export default function SuiteWorkspace() {
 
       setMessages(result);
       setInitialChatLoading(false);
+      hasLoadedChatOnce.current = true;
     } catch (e) {
       console.error('Failed to load team events', e);
       setInitialChatLoading(false);
+      hasLoadedChatOnce.current = true;
     }
   };
   const [selectedArtifact, setSelectedArtifact] = useState<{
@@ -253,6 +256,13 @@ export default function SuiteWorkspace() {
     if (Array.isArray(val)) return val.map((x) => String(x)).join("; ");
     try { return JSON.stringify(val); } catch { return String(val); }
   };
+  const sortAnyById = (rows: any[]): any[] => {
+    try {
+      return [...(rows || [])].sort((a, b) => String(a?.id ?? '').localeCompare(String(b?.id ?? ''), undefined, { numeric: true, sensitivity: 'base' }));
+    } catch {
+      return rows || [];
+    }
+  };
   const flattenTestCaseRows = (rows: any[]): any[] => {
     try {
       const out: any[] = [];
@@ -268,8 +278,12 @@ export default function SuiteWorkspace() {
         const cases = Array.isArray(content?.cases) ? content.cases : [];
         if (cases.length === 0) return;
         cases.forEach((c: any, idx: number) => {
+          const caseIdRaw = c?.id;
+          const caseId = caseIdRaw && String(caseIdRaw).trim()
+            ? stringifyCompact(caseIdRaw)
+            : `${reqId || 'TC'}-${idx + 1}`;
           out.push({
-            id: `${reqId || 'TC'}-${idx + 1}`,
+            id: caseId,
             title: stringifyCompact(c?.title),
             steps: stringifyCompact(c?.steps),
             expected_result: stringifyCompact(c?.expected),
@@ -281,6 +295,20 @@ export default function SuiteWorkspace() {
       return out;
     } catch {
       return [];
+    }
+  };
+  const sortTestCasesByReqThenId = (rows: any[]): any[] => {
+    try {
+      const toStr = (v: any) => String(v == null ? '' : v);
+      return [...(rows || [])].sort((a, b) => {
+        const ra = toStr(a?.requirement_id);
+        const rb = toStr(b?.requirement_id);
+        const cmpReq = ra.localeCompare(rb, undefined, { numeric: true, sensitivity: 'base' });
+        if (cmpReq !== 0) return cmpReq;
+        return toStr(a?.id).localeCompare(toStr(b?.id), undefined, { numeric: true, sensitivity: 'base' });
+      });
+    } catch {
+      return rows || [];
     }
   };
   const formatTeamEvent = (raw: any): { role: 'ai' | 'user'; content: string; messageType?: "sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "requirements-sample-offer" | "testcases-sample-offer" } | null => {
@@ -537,6 +565,46 @@ export default function SuiteWorkspace() {
         if (count > 0) return { role: 'ai', content: `Found ${count} requirements to cover.` };
         return null;
       }
+      if (source === 'testcase_writer' && name === 'edit_testcases_for_req') {
+        const details = String(first?.content ?? '');
+        let editedCount = 0;
+        let summary = '';
+        let reqCodes: string[] = [];
+        let newVersions: (number | string)[] = [];
+        try {
+          let parsed: any;
+          try { parsed = JSON.parse(details); } catch { parsed = JSON.parse(details.replace(/'/g, '"')); }
+          editedCount = Number(parsed?.edited_count ?? 0) || 0;
+          if (Array.isArray(parsed?.results)) {
+            reqCodes = parsed.results.map((r: any) => r?.req_code || r?.requirement_id).filter(Boolean);
+            newVersions = parsed.results.map((r: any) => r?.new_version).filter((v: any) => v != null);
+          }
+          summary = typeof parsed?.summary === 'string' ? parsed.summary : '';
+        } catch {}
+        if (!editedCount) {
+          const m = details.match(/'edited_count'\s*:\s*(\d+)/);
+          editedCount = m ? Number(m[1]) : 0;
+        }
+        if (reqCodes.length === 0) {
+          const m1 = details.match(/'req_code'\s*:\s*'([^']+)'/);
+          const m2 = details.match(/'requirement_id'\s*:\s*'([^']+)'/);
+          if (m1) reqCodes.push(m1[1]);
+          else if (m2) reqCodes.push(m2[1]);
+        }
+        if (newVersions.length === 0) {
+          const m = details.match(/'new_version'\s*:\s*(\d+)/);
+          if (m) newVersions.push(Number(m[1]));
+        }
+        if (!summary) {
+          const m = details.match(/'summary'\s*:\s*'([\s\S]*?)'\s*(?:,|\})/);
+          if (m) summary = m[1];
+        }
+        const reqText = reqCodes.length ? ` for ${[...new Set(reqCodes)].join(', ')}` : '';
+        const versionText = newVersions.length ? `; new version ${newVersions[newVersions.length - 1]}` : '';
+        const countText = editedCount ? `${editedCount} test case${editedCount > 1 ? 's' : ''}` : 'test cases';
+        const summaryText = summary ? ` ${summary}` : '';
+        return { role: 'ai', content: `Edited ${countText}${reqText}${versionText}.${summaryText}` };
+      }
       if (source === 'fetcher' && name === 'store_docs_from_blob') {
         const details = String(first?.content ?? '');
         let stored: string[] = [];
@@ -679,8 +747,8 @@ export default function SuiteWorkspace() {
           supabase.from('requirements').select('*').eq('suite_id', suiteIdVal),
           supabase.from('test_cases').select('*').eq('suite_id', suiteIdVal),
         ]);
-        setDynamicRequirementsRows(reqs || []);
-        setDynamicTestCaseRows(flattenTestCaseRows(tcs || []));
+        setDynamicRequirementsRows(sortAnyById(reqs || []));
+        setDynamicTestCaseRows(sortTestCasesByReqThenId(flattenTestCaseRows(tcs || [])));
       } catch (e) {
         console.error('Failed to fetch dynamic artifacts', e);
       } finally {
@@ -784,7 +852,7 @@ export default function SuiteWorkspace() {
               .from('requirements')
               .select('*')
               .eq('suite_id', suiteIdVal);
-            setDynamicRequirementsRows(data || []);
+            setDynamicRequirementsRows(sortAnyById(data || []));
           } catch (e) {
             console.error('Failed to refresh requirements (realtime)', e);
           }
@@ -799,7 +867,7 @@ export default function SuiteWorkspace() {
               .from('test_cases')
               .select('*')
               .eq('suite_id', suiteIdVal);
-            setDynamicTestCaseRows(flattenTestCaseRows(data || []));
+            setDynamicTestCaseRows(sortTestCasesByReqThenId(flattenTestCaseRows(data || [])));
           } catch (e) {
             console.error('Failed to refresh test cases (realtime)', e);
           }

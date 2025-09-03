@@ -7,6 +7,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional
 from uuid import uuid4
 
@@ -148,9 +149,36 @@ Documents:
         return {"ids": ids}
 
     def generate_and_store_testcases_for_req(
-        req_id: str, style: str = "json"
+        req_id: Optional[str] = None, style: str = "json"
     ) -> Dict[str, Any]:
         reqs = _SUITE_REQUIREMENTS.get(suite_id_value) or []
+
+        # If no req_id is provided, generate for all requirements concurrently
+        if req_id is None:
+            targets = [
+                (r.get("id"), r.get("source", "unknown.txt"), r.get("text", ""))
+                for r in reqs
+                if isinstance(r, dict) and r.get("id")
+            ]
+            if not targets:
+                raise ValueError("No requirements available. Extract requirements first.")
+
+            def _worker(t: tuple[str, str, str]) -> Dict[str, Any]:
+                _rid, _src, _txt = t
+                return generate_and_store_testcases_for_req(_rid, style)
+
+            results: List[Dict[str, Any]] = []
+            errors: List[Dict[str, Any]] = []
+            max_workers = min(6, max(1, len(targets)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_worker, t): t for t in targets}
+                for f in as_completed(futures):
+                    _t = futures[f]
+                    try:
+                        results.append(f.result())
+                    except Exception as e:
+                        errors.append({"req_id": _t[0], "error": str(e)})
+            return {"generated": len(results), "failed": len(errors), "results": results, "errors": errors}
 
         match = next(
             (r for r in reqs if isinstance(r, dict) and r.get("id") == req_id), None
@@ -169,11 +197,15 @@ Return ONLY a JSON object (no markdown, no commentary). Use EXACTLY these fields
   "source": "{source}",
   "requirement_text": "<brief restatement of the requirement>",
   "cases": [
-    {{"type": "happy", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
-    {{"type": "edge", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
-    {{"type": "negative", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}}
+    {{"id": "<short id>", "type": "happy", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
+    {{"id": "<short id>", "type": "edge", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
+    {{"id": "<short id>", "type": "negative", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}}
   ]
 }}
+
+Rules for ids:
+- Provide a concise string id per case (e.g., "TC-1", "TC-2", "TC-3").
+- Ids must be unique within this requirement.
 
 Requirement text:
 {text}
@@ -205,6 +237,7 @@ Requirement text:
                         if not isinstance(c, dict):
                             # Represent non-dict entries as a string row
                             normalized_cases.append({
+                                "id": "",
                                 "type": "info",
                                 "title": str(c),
                                 "preconditions": "",
@@ -223,7 +256,7 @@ Requirement text:
                             else:
                                 normalized_case[key] = str(val)
                         # Ensure scalar string fields
-                        for key in ("title", "type", "expected"):
+                        for key in ("id", "title", "type", "expected"):
                             val = normalized_case.get(key)
                             if val is None:
                                 normalized_case[key] = ""
@@ -231,6 +264,20 @@ Requirement text:
                                 normalized_case[key] = str(val)
                         normalized_cases.append(normalized_case)
                     tc_obj["cases"] = normalized_cases
+                    # Ensure each case has a unique id; assign fallback if missing/blank
+                    used_ids = set()
+                    for idx, case in enumerate(tc_obj["cases"], start=1):
+                        raw_id = case.get("id")
+                        new_id = raw_id.strip() if isinstance(raw_id, str) else ""
+                        if not new_id:
+                            new_id = f"{req_id}-TC-{idx}"
+                        uniq_id = new_id
+                        counter = 2
+                        while uniq_id in used_ids:
+                            uniq_id = f"{new_id}-{counter}"
+                            counter += 1
+                        case["id"] = uniq_id
+                        used_ids.add(uniq_id)
                 # Ensure top-level strings as well
                 for key in ("requirement_id", "source", "requirement_text"):
                     if key in tc_obj and not isinstance(tc_obj[key], str):
@@ -254,108 +301,136 @@ Requirement text:
 
         return "Test cases generated successfully"
 
-    def edit_testcases_for_req(req_id: str, user_edit_request: str) -> Dict[str, Any]:
-        """Edit existing test cases for a requirement, produce LLM diff, and persist a new version.
+    def edit_testcases_for_req(user_edit_request: str) -> Dict[str, Any]:
+        """Edit existing test cases suite-wide based on a freeform user edit request.
 
         Behavior:
-        - Fetch the requirement row by (suite_id, req_code) and the latest test_cases by requirement_id.
-        - Ask the LLM to compute structured diffs (added, removed, edited) and return a full updated "new_testcases" JSON.
-        - Clone by inserting a new row in test_cases with an incremented version (if column exists), else update in place as fallback.
-        - Always include the computed version inside content as a top-level field "version" for robustness with dynamic schemas.
-        - Return a compact payload including the diff and version info.
+        - Fetch ALL requirements and ALL current test_cases for this suite.
+        - Ask the LLM to select impacted requirements and compute diffs plus a complete updated
+          testcases JSON per impacted requirement (schema may be dynamic; preserve unknown fields).
+        - For each impacted requirement, insert a new row in test_cases with an incremented version
+          (if the version column exists); fallback to update/insert without version if unavailable.
+        - Embed the computed version inside each new_testcases content for robustness.
+        - Return a compact payload including per-requirement versions and diffs.
         """
-        # Resolve requirement row
+        # 1) Load requirements for this suite
         try:
             req_rows = (
                 supabase_client
                 .table("requirements")
-                .select("id, content, source_doc")
+                .select("id, req_code, content")
                 .eq("suite_id", suite_id_value)
-                .eq("req_code", req_id)
-                .limit(1)
                 .execute()
                 .data
                 or []
             )
-            if not req_rows:
-                raise ValueError(f"Requirement row not found for req_code={req_id}")
-            requirement_row = req_rows[0]
-            requirement_id = requirement_row.get("id")
-            requirement_content = requirement_row.get("content") or {}
         except Exception as e:
-            raise ValueError(f"Failed to resolve requirement {req_id}: {e}")
+            raise ValueError(f"Failed to load requirements: {e}")
 
-        # Fetch latest existing test cases for this requirement
-        existing_tc_row = None
-        latest_version = None
+        if not req_rows:
+            return {"status": "no_requirements", "message": "No requirements found for this suite."}
+
+        # Build requirement maps
+        req_by_id: Dict[str, Dict[str, Any]] = {}
+        req_by_code: Dict[str, Dict[str, Any]] = {}
+        brief_requirements: List[Dict[str, Any]] = []
+        for r in req_rows:
+            rid = r.get("id")
+            rcode = r.get("req_code")
+            rcontent = r.get("content") or {}
+            brief_requirements.append({
+                "requirement_id": rid,
+                "req_code": rcode,
+                "text": (rcontent or {}).get("text"),
+                "source": (rcontent or {}).get("source"),
+            })
+            if rid:
+                req_by_id[str(rid)] = r
+            if rcode:
+                req_by_code[str(rcode)] = r
+
+        # 2) Load current test cases for this suite
         try:
-            # Prefer versioned ordering if column exists
-            existing_tc_rows = (
+            tc_rows = (
                 supabase_client
                 .table("test_cases")
-                .select("id, content, version, suite_id")
-                .eq("requirement_id", requirement_id)
-                .order("version", desc=True)
-                .limit(1)
+                .select("id, requirement_id, suite_id, content, version")
+                .eq("suite_id", suite_id_value)
                 .execute()
                 .data
                 or []
             )
-            if existing_tc_rows:
-                existing_tc_row = existing_tc_rows[0]
-                latest_version = existing_tc_row.get("version")
-        except Exception:
-            # Fallback for pre-migration schema without version column
+        except Exception as e:
+            tc_rows = []
+
+        # Latest test cases per requirement_id
+        latest_tc_by_req_id: Dict[str, Dict[str, Any]] = {}
+        for row in tc_rows:
+            rid = str(row.get("requirement_id"))
+            curr = latest_tc_by_req_id.get(rid)
             try:
-                existing_tc_rows = (
-                    supabase_client
-                    .table("test_cases")
-                    .select("id, content, suite_id")
-                    .eq("requirement_id", requirement_id)
-                    .limit(1)
-                    .execute()
-                    .data
-                    or []
-                )
-                if existing_tc_rows:
-                    existing_tc_row = existing_tc_rows[0]
+                row_ver = int(row.get("version")) if row.get("version") is not None else None
             except Exception:
-                existing_tc_row = None
+                row_ver = None
+            if curr is None:
+                latest_tc_by_req_id[rid] = row
+            else:
+                try:
+                    curr_ver = int(curr.get("version")) if curr.get("version") is not None else None
+                except Exception:
+                    curr_ver = None
+                if (row_ver or 0) >= (curr_ver or 0):
+                    latest_tc_by_req_id[rid] = row
 
-        old_testcases = (existing_tc_row or {}).get("content") or {}
+        # Brief test cases for context
+        brief_testcases: List[Dict[str, Any]] = []
+        for rid, row in latest_tc_by_req_id.items():
+            req_row = req_by_id.get(rid)
+            brief_testcases.append({
+                "requirement_id": rid,
+                "req_code": (req_row or {}).get("req_code"),
+                "content": row.get("content"),
+                "version": row.get("version"),
+            })
 
-        # Prepare LLM prompt for diffing with dynamic schema
-        requirement_text = ""
-        try:
-            requirement_text = str((requirement_content or {}).get("text") or "")
-        except Exception:
-            requirement_text = ""
+        # 3) Build LLM prompt
+        req_ctx = json.dumps(brief_requirements, ensure_ascii=False)
+        tc_ctx = json.dumps(brief_testcases, ensure_ascii=False)
+        if len(req_ctx) > 12000:
+            req_ctx = req_ctx[:12000] + "\n...truncated..."
+        if len(tc_ctx) > 12000:
+            tc_ctx = tc_ctx[:12000] + "\n...truncated..."
 
         prompt = (
-            "You are a QA assistant. You will update an existing set of test cases based on a user edit request.\n"
-            "- The test cases JSON schema may be dynamic; preserve unknown fields and structure.\n"
-            "- Compute a precise diff and also return the full updated test cases JSON.\n\n"
-            "Return ONLY strict JSON with this shape (no markdown):\n"
+            "You are a senior QA test case editor.\n"
+            "You will process a suite-wide user edit request and update impacted test cases.\n"
+            "Schema may be dynamic; preserve unknown fields and structure.\n\n"
+            "Return ONLY strict JSON (no markdown) with the following shape:\n"
             "{\n"
-            "  \"diff\": {\n"
-            "    \"added\": [<JSON of newly added test case objects>],\n"
-            "    \"removed\": [<JSON of removed test case objects or identifiers>],\n"
-            "    \"edited\": [{\n"
-            "      \"before\": <JSON of original case>,\n"
-            "      \"after\": <JSON of updated case>,\n"
-            "      \"change_note\": \"<short note>\"\n"
-            "    }]\n"
-            "  },\n"
-            "  \"new_testcases\": <FULL JSON of the updated test cases>,\n"
+            "  \"edits\": [\n"
+            "    {\n"
+            "      \"req_code\": \"<REQ-...>\",\n"
+            "      \"requirement_id\": \"<uuid or null>\",\n"
+            "      \"diff\": {\n"
+            "        \"added\": [<JSON case>],\n"
+            "        \"removed\": [<JSON case or identifier>],\n"
+            "        \"edited\": [{\n"
+            "          \"before\": <JSON case>,\n"
+            "          \"after\": <JSON case>,\n"
+            "          \"change_note\": \"<short note>\"\n"
+            "        }]\n"
+            "      },\n"
+            "      \"new_testcases\": <FULL JSON for the updated test cases for this requirement>\n"
+            "    }\n"
+            "  ],\n"
             "  \"summary\": \"<1-2 sentences>\"\n"
             "}\n\n"
-            "Guidelines:\n"
-            "- When matching cases, prefer stable keys like id, title, or type+title; if absent, match by closest content.\n"
-            "- Keep steps/preconditions formatting consistent.\n"
-            "- Do not invent fields not present unless required by the structure.\n"
-            "- Always include new_testcases as the authoritative updated artifact.\n\n"
-            f"Linked Requirement Text (for context):\n{requirement_text}\n\n"
-            f"Existing Test Cases JSON:\n{json.dumps(old_testcases, ensure_ascii=False)}\n\n"
+            "Guidance:\n"
+            "- Choose impacted requirements using req_code and/or requirement_id.\n"
+            "- Keep steps/preconditions formatting consistent; do not drop unknown fields.\n"
+            "- If nothing applies, return \"edits\": [].\n\n"
+            f"Requirements Context:\n{req_ctx}\n\n"
+            f"Current Test Cases Context (latest per requirement):\n{tc_ctx}\n\n"
             f"User Edit Request:\n{user_edit_request}\n"
         )
 
@@ -370,93 +445,127 @@ Requirement text:
             )
             raw = resp.choices[0].message.content or "{}"
             llm_out = json.loads(raw)
+            assert isinstance(llm_out, dict)
         except Exception as e:
-            raise ValueError(f"Invalid JSON from edit diff generator: {e}")
+            raise ValueError(f"Invalid JSON from bulk edit generator: {e}")
 
-        diff = llm_out.get("diff") or {}
-        new_testcases = llm_out.get("new_testcases") or old_testcases
+        edits = llm_out.get("edits") or []
         summary = llm_out.get("summary") or ""
+        if not isinstance(edits, list):
+            edits = []
 
-        # Decide next version
-        try:
-            prev_version_val = int(latest_version) if latest_version is not None else None
-        except Exception:
-            prev_version_val = None
-        next_version = (prev_version_val or 1) + 1 if existing_tc_row else 1
+        results: List[Dict[str, Any]] = []
+        event_edits: List[Dict[str, Any]] = []
 
-        # Ensure the content itself carries a version hint for robustness with dynamic schemas
-        if isinstance(new_testcases, dict) and "version" not in new_testcases:
+        # 4) Apply edits per requirement
+        for e in edits:
+            if not isinstance(e, dict):
+                continue
+            req_code = e.get("req_code")
+            target_req_id = e.get("requirement_id")
+            new_testcases = e.get("new_testcases")
+            diff = e.get("diff") or {}
+
+            # Resolve requirement id via code if needed
+            req_row = None
+            if target_req_id and str(target_req_id) in req_by_id:
+                req_row = req_by_id[str(target_req_id)]
+            elif req_code and str(req_code) in req_by_code:
+                req_row = req_by_code[str(req_code)]
+            if not req_row:
+                # Skip unknown requirement reference
+                event_edits.append({"req_code": req_code, "error": "requirement_not_found"})
+                continue
+
+            resolved_req_id = req_row.get("id")
+            latest_row = latest_tc_by_req_id.get(str(resolved_req_id))
             try:
-                new_testcases_with_meta = dict(new_testcases)
-                new_testcases_with_meta["version"] = next_version
-                new_testcases = new_testcases_with_meta
+                old_version = int((latest_row or {}).get("version")) if (latest_row or {}).get("version") is not None else None
             except Exception:
-                pass
+                old_version = None
+            new_version = (old_version or 1) + 1 if latest_row else 1
 
-        # Persist: insert a new versioned row if possible; fallback to update in place
-        inserted_row_id: Optional[str] = None
-        try:
+            # Ensure version embedded
+            if isinstance(new_testcases, dict) and "version" not in new_testcases:
+                try:
+                    ntc = dict(new_testcases)
+                    ntc["version"] = new_version
+                    new_testcases = ntc
+                except Exception:
+                    pass
+
+            inserted_row_id: Optional[str] = None
             # Try versioned insert
-            insert_payload = {
-                "requirement_id": requirement_id,
-                "suite_id": suite_id_value,
-                "content": new_testcases,
-                "version": next_version,
-            }
-            res = (
-                supabase_client
-                .table("test_cases")
-                .insert(insert_payload)
-                .execute()
-            )
             try:
-                inserted_row_id = ((res.data or [])[0] or {}).get("id")
-            except Exception:
-                inserted_row_id = None
-        except Exception:
-            # Fallback: update existing row in place (pre-migration), if any; else insert without version
-            try:
-                if existing_tc_row and existing_tc_row.get("id"):
-                    supabase_client.table("test_cases").update({
-                        "content": new_testcases,
+                res = (
+                    supabase_client
+                    .table("test_cases")
+                    .insert({
+                        "requirement_id": resolved_req_id,
                         "suite_id": suite_id_value,
-                    }).eq("id", existing_tc_row.get("id")).execute()
-                    inserted_row_id = existing_tc_row.get("id")
-                else:
-                    res2 = (
-                        supabase_client
-                        .table("test_cases")
-                        .insert({
-                            "requirement_id": requirement_id,
-                            "suite_id": suite_id_value,
-                            "content": new_testcases,
-                        })
-                        .execute()
-                    )
-                    try:
-                        inserted_row_id = ((res2.data or [])[0] or {}).get("id")
-                    except Exception:
-                        inserted_row_id = None
+                        "content": new_testcases,
+                        "version": new_version,
+                    })
+                    .execute()
+                )
+                try:
+                    inserted_row_id = ((res.data or [])[0] or {}).get("id")
+                except Exception:
+                    inserted_row_id = None
             except Exception:
-                # Last-resort: swallow persistence failure to avoid breaking the flow
-                pass
+                # Fallback to update/insert without version
+                try:
+                    if latest_row and latest_row.get("id"):
+                        supabase_client.table("test_cases").update({
+                            "content": new_testcases,
+                            "suite_id": suite_id_value,
+                        }).eq("id", latest_row.get("id")).execute()
+                        inserted_row_id = latest_row.get("id")
+                    else:
+                        res2 = (
+                            supabase_client
+                            .table("test_cases")
+                            .insert({
+                                "requirement_id": resolved_req_id,
+                                "suite_id": suite_id_value,
+                                "content": new_testcases,
+                            })
+                            .execute()
+                        )
+                        try:
+                            inserted_row_id = ((res2.data or [])[0] or {}).get("id")
+                        except Exception:
+                            inserted_row_id = None
+                except Exception:
+                    pass
 
-        # Emit an event for auditability (best-effort) and for user-facing display
+            results.append({
+                "requirement_id": resolved_req_id,
+                "req_code": req_row.get("req_code"),
+                "old_version": old_version or (1 if latest_row else 0),
+                "new_version": new_version,
+                "row_id": inserted_row_id,
+            })
+            event_edits.append({
+                "requirement_id": resolved_req_id,
+                "req_code": req_row.get("req_code"),
+                "diff": diff,
+                "new_testcases": new_testcases,
+                "old_version": old_version or (1 if latest_row else 0),
+                "new_version": new_version,
+                "row_id": inserted_row_id,
+            })
+
+        # 5) Record one bulk event (best-effort)
         try:
             _results_writer.write_event(
                 suite_id=suite_id_value,
                 event={
-                    "type": "testcases_edited",
+                    "type": "testcases_edited_bulk",
                     "suite_id": suite_id_value,
-                    "req_code": req_id,
-                    "requirement_id": requirement_id,
-                    "user_edit_request": user_edit_request,
-                    "old_version": prev_version_val or (1 if existing_tc_row else 0),
-                    "new_version": next_version,
-                    "diff": diff,
-                    "new_testcases": new_testcases,
+                    "edits": event_edits,
                     "summary": summary,
-                    "row_id": inserted_row_id,
+                    "user_edit_request": user_edit_request,
                 },
                 message_id=message_id,
             )
@@ -464,13 +573,8 @@ Requirement text:
             pass
 
         return {
-            "requirement_id": requirement_id,
-            "req_code": req_id,
-            "old_version": prev_version_val or (1 if existing_tc_row else 0),
-            "new_version": next_version,
-            "diff": diff,
-            "new_testcases": new_testcases,
-            "user_edit_request": user_edit_request,
+            "edited_count": len(results),
+            "results": results,
             "summary": summary,
             "status": "ok",
         }
@@ -881,8 +985,8 @@ Documents:
             "       On the next reply: if it's 'Yes please', handoff to requirements_extractor. If it's 'CONTINUE', handoff to testcase_writer to generate cases directly from docs.\n"
             "     - Otherwise (no explicit direct test-case request): handoff to requirements_extractor by default.\n"
             "     - If the user's request is to EDIT or UPDATE existing test cases (phrases like 'edit', 'update', 'revise', 'modify', 'tweak steps/titles/expected'):\n"
-            "       Immediately handoff to testcase_writer to run edit_testcases_for_req(req_id, user_edit_request).\n"
-            "       If req_id is not in the message, ask the user to specify the requirement ID and the requested change using ask_user(event_type=\\\"sample_confirmation\\\", response_to_user=\\\"Please provide the requirement ID (e.g., REQ-3) and a brief edit request.\\\").\n"
+            "       Immediately handoff to testcase_writer to run edit_testcases_for_req(user_edit_request).\n"
+            "       If additional clarification is needed, ask the user to specify the scope or examples using ask_user(event_type=\\\"sample_confirmation\\\", response_to_user=\\\"Please describe which areas to adjust (titles, steps, expected outcomes, or specific requirements).\\\").\n"
             "  5) After requirements_extractor finishes, it will ask ask_user(event_type=\\\"requirements_feedback\\\"). Wait for the next user reply.\n"
             "     If the reply is 'CONTINUE', handoff to testcase_writer to generate full test cases; then summarize and write TERMINATE.\n"
             "     If the reply indicates changes or hesitation (anything other than 'CONTINUE'), respond briefly and write TERMINATE.\n"
@@ -892,7 +996,7 @@ Documents:
             "Always confirm immediate next steps with the user via ask_user BEFORE proceeding, EXCEPT when the user explicitly requests to edit test cases—then handoff directly to testcase_writer. For example: ask_user(event_type=\"quality_confirmation\", response_to_user=\"Should I extract requirements first for easier tracking before generating test cases?\").\n"
             "If the user has specified a testing focus (e.g., unit or integration), call identify_gaps(testing_type=...). If not, identify_gaps will include 'testing_type_needed' and a follow-up prompt in its JSON/text output.\n"
             "If the user asks questions about existing requirements or test cases, use get_requirements_info(question=...) or get_testcases_info(question=...) to answer conciesly then write TERMINATE.\n"
-            "If the user asks to edit test cases, do not answer directly; handoff to testcase_writer.\n"
+            "If the user asks to edit test cases, you must handoff/transfer to testcase_writer.\n"
         ),
     )
 
@@ -926,12 +1030,12 @@ Documents:
         "testcase_writer",
         model_client=model_client,
         handoffs=["planner"],
-        tools=[list_requirement_ids, generate_and_store_testcases_for_req, generate_direct_testcases_on_docs, edit_testcases_for_req],
+        tools=[generate_and_store_testcases_for_req, generate_direct_testcases_on_docs, edit_testcases_for_req],
         system_message=(
             "If asked to generate test cases directly from docs, you must call generate_direct_testcases_on_docs() then transfer back to planner\n"
-            "Otherwise: 1) Call list_requirement_ids() to get only IDs.\n"
-            "2) For each id, call generate_and_store_testcases_for_req(req_id).\n"
-            "If asked to edit test cases for a specific requirement, call edit_testcases_for_req(req_id, user_edit_request) which computes diffs and persists a new version.\n"
+            "Otherwise: If requirement id is not provided, call generate_and_store_testcases_for_req() to generate for ALL requirements concurrently (rate-limited).\n"
+            "If a specific requirement is provided, call generate_and_store_testcases_for_req(req_id).\n"
+            "If asked to edit test cases, call edit_testcases_for_req(user_edit_request) to compute diffs suite-wide and persist new versions.\n"
             "Then handoff back to the planner.\n"
             "If the user asks about test cases or requirements information, do not answer; handoff to planner so it can respond using its info tools."
         ),

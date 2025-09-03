@@ -106,3 +106,54 @@ where message_id is null;
 alter table if exists public.team_events
   alter column message_id set not null;
 
+-- 1) Add version column with default 1
+ALTER TABLE public.test_cases
+ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 1;
+
+-- 2) Backfill existing rows to 1 explicitly (optional but makes value concrete)
+UPDATE public.test_cases
+SET version = 1
+WHERE version IS NULL;
+
+-- 3) Optional: add an index to quickly fetch the latest version per requirement
+CREATE INDEX IF NOT EXISTS idx_test_cases_requirement_version
+  ON public.test_cases (requirement_id, version DESC);
+
+-- 4) Optional: enforce uniqueness per (requirement_id, version)
+-- Comment out if you plan to allow overwrites at same version.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'uq_test_cases_requirement_version'
+  ) THEN
+    ALTER TABLE public.test_cases
+    ADD CONSTRAINT uq_test_cases_requirement_version
+    UNIQUE (requirement_id, version);
+  END IF;
+END$$;
+
+-- 5) Optional: trigger to auto-increment version per requirement on insert
+-- If you prefer client-side control, skip this section.
+CREATE OR REPLACE FUNCTION public.test_cases_set_next_version()
+RETURNS trigger AS $$
+DECLARE
+  max_ver integer;
+BEGIN
+  IF NEW.version IS NULL THEN
+    SELECT COALESCE(MAX(version), 0) INTO max_ver
+    FROM public.test_cases
+    WHERE requirement_id = NEW.requirement_id;
+
+    NEW.version := max_ver + 1;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_test_cases_set_next_version ON public.test_cases;
+CREATE TRIGGER trg_test_cases_set_next_version
+BEFORE INSERT ON public.test_cases
+FOR EACH ROW
+EXECUTE FUNCTION public.test_cases_set_next_version();
