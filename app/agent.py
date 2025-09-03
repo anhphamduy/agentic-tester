@@ -313,6 +313,12 @@ Requirement text:
         - Embed the computed version inside each new_testcases content for robustness.
         - Return a compact payload including per-requirement versions and diffs.
         """
+        # Local natural key sorter for human-friendly ordering like REQ-9 < REQ-10
+        def _natural_key(value: Any):
+            s = str(value or "")
+            parts = re.split(r"(\d+)", s)
+            return tuple(int(p) if p.isdigit() else p for p in parts)
+
         # 1) Load requirements for this suite
         try:
             req_rows = (
@@ -329,6 +335,12 @@ Requirement text:
 
         if not req_rows:
             return {"status": "no_requirements", "message": "No requirements found for this suite."}
+
+        # Sort requirements by requirement id (natural/lexicographic)
+        try:
+            req_rows = sorted(req_rows, key=lambda r: _natural_key(r.get("id") or r.get("req_code")))
+        except Exception:
+            pass
 
         # Build requirement maps
         req_by_id: Dict[str, Dict[str, Any]] = {}
@@ -382,14 +394,33 @@ Requirement text:
                 if (row_ver or 0) >= (curr_ver or 0):
                     latest_tc_by_req_id[rid] = row
 
-        # Brief test cases for context
+        # Brief test cases for context (sorted by requirement id, then by test case id inside content)
         brief_testcases: List[Dict[str, Any]] = []
-        for rid, row in latest_tc_by_req_id.items():
+        try:
+            sorted_req_ids = sorted(latest_tc_by_req_id.keys(), key=_natural_key)
+        except Exception:
+            sorted_req_ids = list(latest_tc_by_req_id.keys())
+
+        for rid in sorted_req_ids:
+            row = latest_tc_by_req_id[rid]
             req_row = req_by_id.get(rid)
+            content = row.get("content")
+            # If content has a cases list, sort it by case id
+            if isinstance(content, dict):
+                try:
+                    cases = content.get("cases")
+                    if isinstance(cases, list):
+                        sorted_cases = sorted(
+                            cases,
+                            key=lambda c: _natural_key((c or {}).get("id"))
+                        )
+                        content = {**content, "cases": sorted_cases}
+                except Exception:
+                    pass
             brief_testcases.append({
                 "requirement_id": rid,
                 "req_code": (req_row or {}).get("req_code"),
-                "content": row.get("content"),
+                "content": content,
                 "version": row.get("version"),
             })
 

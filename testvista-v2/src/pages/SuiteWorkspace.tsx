@@ -114,6 +114,7 @@ export default function SuiteWorkspace() {
   const [dynamicRequirementsRows, setDynamicRequirementsRows] = useState<any[]>([]);
   const [dynamicTestCaseRows, setDynamicTestCaseRows] = useState<any[]>([]);
   const [agentLoading, setAgentLoading] = useState(false);
+  const [activeArtifactsTab, setActiveArtifactsTab] = useState<"requirements" | "viewpoints" | "testcases">("requirements");
   const [initialChatLoading, setInitialChatLoading] = useState(true);
   const hasLoadedChatOnce = useRef(false);
   const loadTeamEvents = async () => {
@@ -349,6 +350,14 @@ export default function SuiteWorkspace() {
     if (type === 'ToolCallRequestEvent') {
       const first = Array.isArray(raw?.content) ? raw.content[0] : undefined;
       const name = first?.name as string | undefined;
+      if (source === 'testcase_writer' && name === 'edit_testcases_for_req') {
+        try {
+          const jsonBlock = '```json\n' + JSON.stringify(raw, null, 2) + '\n```';
+          return { role: 'ai', content: `AI is editing test cases\n\n${jsonBlock}` };
+        } catch {
+          return { role: 'ai', content: `AI is editing test cases` };
+        }
+      }
       if (source === 'planner' && name === 'generate_preview') {
         return { role: 'ai', content: `I'm generating a short preview...` };
       }
@@ -853,6 +862,8 @@ export default function SuiteWorkspace() {
               .select('*')
               .eq('suite_id', suiteIdVal);
             setDynamicRequirementsRows(sortAnyById(data || []));
+            // Jump to requirements tab on any realtime change
+            setActiveArtifactsTab('requirements');
           } catch (e) {
             console.error('Failed to refresh requirements (realtime)', e);
           }
@@ -868,6 +879,8 @@ export default function SuiteWorkspace() {
               .select('*')
               .eq('suite_id', suiteIdVal);
             setDynamicTestCaseRows(sortTestCasesByReqThenId(flattenTestCaseRows(data || [])));
+            // Jump to test cases tab on any realtime change
+            setActiveArtifactsTab('testcases');
           } catch (e) {
             console.error('Failed to refresh test cases (realtime)', e);
           }
@@ -1542,6 +1555,8 @@ export default function SuiteWorkspace() {
             requirements={requirements} 
             viewpoints={viewpoints} 
             testCases={testCases} 
+            activeTab={activeArtifactsTab}
+            onActiveTabChange={setActiveArtifactsTab}
             dynamicRequirementsRows={dynamicRequirementsRows}
             dynamicTestCaseRows={dynamicTestCaseRows}
             loadingStates={loadingStates}

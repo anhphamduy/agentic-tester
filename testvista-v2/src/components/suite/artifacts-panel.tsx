@@ -104,6 +104,8 @@ interface ArtifactsPanelProps {
   testCases: TestCase[];
   dynamicRequirementsRows?: any[];
   dynamicTestCaseRows?: any[];
+  activeTab?: "requirements" | "viewpoints" | "testcases";
+  onActiveTabChange?: (tab: "requirements" | "viewpoints" | "testcases") => void;
   onUpdateRequirement: (
     id: string,
     data: Partial<Requirement>,
@@ -147,6 +149,8 @@ export function ArtifactsPanel({
   testCases,
   dynamicRequirementsRows = [],
   dynamicTestCaseRows = [],
+  activeTab: activeTabProp,
+  onActiveTabChange,
   onUpdateRequirement,
   onUpdateViewpoint,
   onUpdateTestCase,
@@ -159,7 +163,12 @@ export function ArtifactsPanel({
   loadingStates = {},
   agentLoading = false,
 }: ArtifactsPanelProps) {
-  const [activeTab, setActiveTab] = useState("requirements");
+  const [internalTab, setInternalTab] = useState<"requirements" | "viewpoints" | "testcases">("requirements");
+  const activeTab = activeTabProp ?? internalTab;
+  const handleTabChange = (val: "requirements" | "viewpoints" | "testcases") => {
+    if (onActiveTabChange) onActiveTabChange(val);
+    else setInternalTab(val);
+  };
   const [editingCell, setEditingCell] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const reqCount = dynamicRequirementsRows.length ? dynamicRequirementsRows.length : requirements.length;
@@ -416,7 +425,7 @@ export function ArtifactsPanel({
     <div className="h-full flex flex-col bg-background min-h-0">
       <Tabs
         value={activeTab}
-        onValueChange={setActiveTab}
+        onValueChange={(v) => handleTabChange(v as any)}
         className="h-full flex flex-col min-h-0"
       >
         {/* Tab Headers */}
@@ -460,6 +469,8 @@ export function ArtifactsPanel({
                       requirements={requirements}
                       viewpoints={viewpoints}
                       testCases={testCases}
+                      activeTab={activeTab}
+                      onActiveTabChange={handleTabChange}
                       onUpdateRequirement={onUpdateRequirement}
                       onUpdateViewpoint={onUpdateViewpoint}
                       onUpdateTestCase={onUpdateTestCase}
