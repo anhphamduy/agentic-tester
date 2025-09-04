@@ -17,10 +17,11 @@ interface Message {
   role: "user" | "ai";
   content: string;
   timestamp: Date;
-  type?: "command" | "normal" | "artifact-selection" | "next-step" | "version-action" | "sample-confirmation" | "quality-confirmation";
+  type?: "command" | "normal" | "artifact-selection" | "next-step" | "version-action" | "sample-confirmation" | "quality-confirmation" | "version-update";
   needsImplementation?: boolean;
   implementationPlan?: string;
   versionInfo?: ArtifactVersion;
+  versionNumber?: number;
   versionData?: {
     name: string;
     id: string;
@@ -172,13 +173,19 @@ export default function SuiteWorkspace() {
         if (!formatted) return;
         const meta = extractToolMeta(obj);
         ensureAiBlock(ev.created_at);
-        const msgType = (formatted as any)?.messageType as ("sample-confirmation" | "quality-confirmation" | "requirements-feedback" | undefined);
+        const msgType = (formatted as any)?.messageType as ("sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "version-update" | undefined);
 
         if (msgType) {
-          // For confirmation-style messages, show only the response_to_user, clear prior noise
-          aiLines = [formatted.content];
-          callIdToIndex = {};
-          currentAi!.type = msgType as any;
+          if (msgType === 'version-update') {
+            // Do not inject raw version text into the chat body; only tag the message
+            currentAi!.type = msgType as any;
+            (currentAi as any).versionNumber = (formatted as any)?.version as number | undefined;
+          } else {
+            // For confirmation-style messages, show only the response_to_user, clear prior noise
+            aiLines = [formatted.content];
+            callIdToIndex = {};
+            currentAi!.type = msgType as any;
+          }
         } else if (meta.isRequest && meta.callId) {
           aiLines.push(`⏳ ${formatted.content}`);
           callIdToIndex[meta.callId] = aiLines.length - 1;
@@ -312,11 +319,22 @@ export default function SuiteWorkspace() {
       return rows || [];
     }
   };
-  const formatTeamEvent = (raw: any): { role: 'ai' | 'user'; content: string; messageType?: "sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "requirements-sample-offer" | "testcases-sample-offer" } | null => {
+  const formatTeamEvent = (raw: any): { role: 'ai' | 'user'; content: string; messageType?: "sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "requirements-sample-offer" | "testcases-sample-offer" | "version-update"; version?: number } | null => {
     console.log(raw)
     const type = raw?.type;
     const source = raw?.source;
 
+    // Handle bulk test case edits -> version update message
+    if (type === 'testcases_edited_bulk') {
+      try {
+        const firstEdit = Array.isArray(raw?.edits) && raw.edits.length > 0 ? raw.edits[0] : {};
+        const newVersion = (typeof raw?.new_version === 'number' ? raw.new_version : (typeof firstEdit?.new_version === 'number' ? firstEdit.new_version : (typeof raw?.new_testcases?.version === 'number' ? raw.new_testcases.version : undefined)));
+        if (newVersion != null) {
+          return { role: 'ai', content: String(newVersion), messageType: 'version-update', version: Number(newVersion) } as any;
+        }
+      } catch {}
+      return null;
+    }
     // Direct nested event payloads (e.g., {'event': {'type': 'ask_user', 'event_type': 'sample_confirmation', 'response_to_user': '...'}})
     if (raw?.event && typeof raw.event === 'object' && raw.event.type === 'ask_user') {
       const eventType = raw.event.event_type || raw.event.eventType || '';
@@ -813,10 +831,15 @@ export default function SuiteWorkspace() {
             const agg = ((window as any).__aiAgg ||= { aiId: existing.id, callIndex: {} });
             if (agg.aiId !== existing.id) { agg.aiId = existing.id; agg.callIndex = {}; }
 
-            const messageType = (formatted as any)?.messageType as ("sample-confirmation" | "quality-confirmation" | "requirements-feedback" | undefined);
+            const messageType = (formatted as any)?.messageType as ("sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "version-update" | undefined);
             if (messageType) {
-              // Replace block with only the response_to_user
-              next[idx] = { ...existing, content: formatted.content, type: messageType, timestamp: new Date(ev.created_at) } as any;
+              if (messageType === 'version-update') {
+                // Do not inject raw version into the content lines; only tag the message
+                next[idx] = { ...existing, type: messageType, timestamp: new Date(ev.created_at), versionNumber: (formatted as any)?.version as number | undefined } as any;
+              } else {
+                // Replace block with only the response_to_user
+                next[idx] = { ...existing, content: formatted.content, type: messageType, timestamp: new Date(ev.created_at) } as any;
+              }
               (window as any).__aiAgg = { aiId: existing.id, callIndex: {} };
               return next;
             }

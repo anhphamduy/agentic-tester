@@ -7,7 +7,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Send, Bot, User, Upload, Zap, Target, Plus, Lightbulb, ArrowUp, AtSign, MessageSquare, Clock, FileText, File } from "lucide-react";
+import { Send, Bot, User, Upload, Zap, Target, Plus, Lightbulb, ArrowUp, AtSign, MessageSquare, Clock, FileText, File, RotateCcw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
 import { ArtifactSelectionChips } from "./artifact-selection-chips";
@@ -20,10 +20,11 @@ interface Message {
   role: "user" | "ai";
   content: string;
   timestamp: Date;
-  type?: "command" | "normal" | "artifact-selection" | "next-step" | "version-action" | "sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "requirements-sample-offer" | "testcases-sample-offer";
+  type?: "command" | "normal" | "artifact-selection" | "next-step" | "version-action" | "sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "requirements-sample-offer" | "testcases-sample-offer" | "version-update";
   needsImplementation?: boolean;
   implementationPlan?: string;
   versionInfo?: import("@/types/version").ArtifactVersion;
+  versionNumber?: number;
   versionData?: {
     name: string;
     id: string;
@@ -257,6 +258,29 @@ export function ChatPanel({
                       >
                         Proceed to Test Cases
                       </Button>
+                    </div>
+                  </div>
+                )}
+                
+                {/* Version update: full-width banner with actions */}
+                {message.role === "ai" && message.type === 'version-update' && (
+                  <div className="mt-2">
+                    <div className="pt-2 border-t border-border/20">
+                      <div className="w-full flex items-center justify-between gap-2 rounded-md bg-muted/30 border border-border/30 px-3 py-1.5">
+                        <div className="text-xs font-medium text-muted-foreground">
+                          New Version v{String(message.versionNumber ?? message.content).replace(/^v/i, '')}
+                        </div>
+                        {onVersionAction && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            onClick={() => onVersionAction({ type: 'restore', versionId: String(message.versionNumber ?? message.content) })}
+                          >
+                            <RotateCcw className="mr-2 h-3.5 w-3.5" /> Restore
+                          </Button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}

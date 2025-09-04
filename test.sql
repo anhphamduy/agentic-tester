@@ -157,3 +157,6 @@ CREATE TRIGGER trg_test_cases_set_next_version
 BEFORE INSERT ON public.test_cases
 FOR EACH ROW
 EXECUTE FUNCTION public.test_cases_set_next_version();
+
+ALTER TABLE test_cases
+DROP CONSTRAINT test_cases_requirement_id_key;

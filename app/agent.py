@@ -543,7 +543,8 @@ Requirement text:
                     inserted_row_id = ((res.data or [])[0] or {}).get("id")
                 except Exception:
                     inserted_row_id = None
-            except Exception:
+            except Exception as e:
+                print(f"Error inserting test case: {e}")
                 # Fallback to update/insert without version
                 try:
                     if latest_row and latest_row.get("id"):
@@ -588,20 +589,17 @@ Requirement text:
             })
 
         # 5) Record one bulk event (best-effort)
-        try:
-            _results_writer.write_event(
-                suite_id=suite_id_value,
-                event={
-                    "type": "testcases_edited_bulk",
-                    "suite_id": suite_id_value,
-                    "edits": event_edits,
-                    "summary": summary,
-                    "user_edit_request": user_edit_request,
-                },
-                message_id=message_id,
-            )
-        except Exception:
-            pass
+        _results_writer.write_event(
+            suite_id=suite_id_value,
+            event={
+                "type": "testcases_edited_bulk",
+                "suite_id": suite_id_value,
+                "edits": event_edits,
+                "summary": summary,
+                "user_edit_request": user_edit_request,
+            },
+            message_id=message_id,
+        )
 
         return {
             "edited_count": len(results),
@@ -1113,7 +1111,7 @@ def _get_suite_agent_state(suite_id: Optional[str]) -> Optional[Dict[str, Any]]:
 
 async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: Optional[str] = None):
     _message_id = message_id or str(uuid4())
-    local_team = make_team_for_suite(suite_id, message_id)
+    local_team = make_team_for_suite(suite_id, _message_id)
     # Mark suite as chatting/running (best-effort)
     try:
         if suite_id:
