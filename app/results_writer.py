@@ -278,9 +278,4 @@ class SupabaseResultsWriter(ResultsWriter):
         if not data:
             return None
         state_obj = data[0].get("state")
-        if isinstance(state_obj, dict):
-            agent_state = state_obj.get("agent_state")
-            if isinstance(agent_state, dict):
-                return agent_state
-            return state_obj
-        return None
+        return state_obj

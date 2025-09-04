@@ -41,6 +41,7 @@ interface ChatPanelProps {
   onVersionAction?: (action: VersionAction) => void;
   onViewHistory?: () => void;
   uploadedFiles?: { id: string; name: string; type: string }[];
+  latestTestcasesVersion?: number;
 }
 const slashCommands = [{
   cmd: "/upload",
@@ -66,7 +67,8 @@ export function ChatPanel({
   hasUnsavedChanges = false,
   onVersionAction,
   onViewHistory,
-  uploadedFiles = []
+  uploadedFiles = [],
+  latestTestcasesVersion
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [showCommands, setShowCommands] = useState(false);
@@ -253,7 +255,7 @@ export function ChatPanel({
                         variant="default"
                         size="sm"
                         className="text-xs"
-                        onClick={() => onSendMessage("CONTINUE")}
+                        onClick={() => onSendMessage("Generate test cases")}
                         disabled={idx < messages.length - 1}
                       >
                         Proceed to Test Cases
@@ -276,6 +278,10 @@ export function ChatPanel({
                             size="sm"
                             className="h-7 px-2 text-xs"
                             onClick={() => onVersionAction({ type: 'restore', versionId: String(message.versionNumber ?? message.content) })}
+                            disabled={(() => {
+                              const v = parseInt(String(message.versionNumber ?? message.content), 10);
+                              return !Number.isFinite(v) || (latestTestcasesVersion !== undefined && v >= latestTestcasesVersion);
+                            })()}
                           >
                             <RotateCcw className="mr-2 h-3.5 w-3.5" /> Restore
                           </Button>

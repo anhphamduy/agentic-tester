@@ -271,6 +271,13 @@ export default function SuiteWorkspace() {
       return rows || [];
     }
   };
+  const sortRequirementsByReqCode = (rows: any[]): any[] => {
+    try {
+      return [...(rows || [])].sort((a, b) => String(a?.req_code ?? '').localeCompare(String(b?.req_code ?? ''), undefined, { numeric: true, sensitivity: 'base' }));
+    } catch {
+      return rows || [];
+    }
+  };
   const flattenTestCaseRows = (rows: any[]): any[] => {
     try {
       const out: any[] = [];
@@ -283,6 +290,28 @@ export default function SuiteWorkspace() {
           return c || {};
         })();
         const reqId = content?.requirement_id || r?.requirement_id || r?.id || '';
+        // Try to extract a version number from common locations; default to 1 if missing
+        const version = (() => {
+          try {
+            const candidates: any[] = [
+              (r as any)?.version,
+              (r as any)?.ver,
+              (r as any)?.v,
+              (r as any)?.testcases_version,
+              (r as any)?.test_case_version,
+              content?.version,
+              content?.testcases?.version,
+              content?.test_cases?.version,
+              (r as any)?.new_version,
+              (r as any)?.current_version,
+            ];
+            for (const cand of candidates) {
+              const n = typeof cand === 'number' ? cand : parseInt(String(cand ?? ''), 10);
+              if (!Number.isNaN(n) && n > 0) return n;
+            }
+          } catch {}
+          return 1;
+        })();
         const cases = Array.isArray(content?.cases) ? content.cases : [];
         if (cases.length === 0) return;
         cases.forEach((c: any, idx: number) => {
@@ -297,12 +326,33 @@ export default function SuiteWorkspace() {
             expected_result: stringifyCompact(c?.expected),
             severity: stringifyCompact(c?.type),
             requirement_id: reqId,
+            version,
           });
         });
       });
       return out;
     } catch {
       return [];
+    }
+  };
+  // Keep only the latest test case rows per requirement based on the highest version
+  const filterLatestTestcasesByRequirement = (rows: any[]): any[] => {
+    try {
+      const latestByReq: Record<string, number> = {};
+      for (const row of rows || []) {
+        const rid = String(row?.requirement_id ?? '');
+        if (!rid) continue;
+        const v = typeof row?.version === 'number' ? row.version : parseInt(String(row?.version ?? ''), 10) || 1;
+        if (latestByReq[rid] == null || v > latestByReq[rid]) latestByReq[rid] = v;
+      }
+      return (rows || []).filter((row) => {
+        const rid = String(row?.requirement_id ?? '');
+        if (!rid) return false;
+        const v = typeof row?.version === 'number' ? row.version : parseInt(String(row?.version ?? ''), 10) || 1;
+        return v === latestByReq[rid];
+      });
+    } catch {
+      return rows || [];
     }
   };
   const sortTestCasesByReqThenId = (rows: any[]): any[] => {
@@ -774,8 +824,12 @@ export default function SuiteWorkspace() {
           supabase.from('requirements').select('*').eq('suite_id', suiteIdVal),
           supabase.from('test_cases').select('*').eq('suite_id', suiteIdVal),
         ]);
-        setDynamicRequirementsRows(sortAnyById(reqs || []));
-        setDynamicTestCaseRows(sortTestCasesByReqThenId(flattenTestCaseRows(tcs || [])));
+        setDynamicRequirementsRows(sortRequirementsByReqCode(reqs || []));
+        {
+          const flattened = flattenTestCaseRows(tcs || []);
+          const latestOnly = filterLatestTestcasesByRequirement(flattened);
+          setDynamicTestCaseRows(sortTestCasesByReqThenId(latestOnly));
+        }
       } catch (e) {
         console.error('Failed to fetch dynamic artifacts', e);
       } finally {
@@ -884,7 +938,7 @@ export default function SuiteWorkspace() {
               .from('requirements')
               .select('*')
               .eq('suite_id', suiteIdVal);
-            setDynamicRequirementsRows(sortAnyById(data || []));
+            setDynamicRequirementsRows(sortRequirementsByReqCode(data || []));
             // Jump to requirements tab on any realtime change
             setActiveArtifactsTab('requirements');
           } catch (e) {
@@ -901,7 +955,11 @@ export default function SuiteWorkspace() {
               .from('test_cases')
               .select('*')
               .eq('suite_id', suiteIdVal);
-            setDynamicTestCaseRows(sortTestCasesByReqThenId(flattenTestCaseRows(data || [])));
+            {
+              const flattened = flattenTestCaseRows(data || []);
+              const latestOnly = filterLatestTestcasesByRequirement(flattened);
+              setDynamicTestCaseRows(sortTestCasesByReqThenId(latestOnly));
+            }
             // Jump to test cases tab on any realtime change
             setActiveArtifactsTab('testcases');
           } catch (e) {
@@ -916,6 +974,8 @@ export default function SuiteWorkspace() {
     };
   }, [id]);
 
+  // Track latest test case version from test_suites.state
+  const [latestTestcasesVersion, setLatestTestcasesVersion] = useState<number | undefined>(undefined);
   // Listen to suite status (chatting/idle) from 'test_suites' table and set spinner
   useEffect(() => {
     const suiteIdParam = new URLSearchParams(window.location.search).get('suiteId');
@@ -926,11 +986,17 @@ export default function SuiteWorkspace() {
       try {
         const { data } = await supabase
           .from('test_suites')
-          .select('status')
+          .select('status, state')
           .eq('id', suiteIdVal)
           .maybeSingle();
         const status = (data as any)?.status as string | undefined;
         setAgentLoading(status === 'chatting' || status === 'running');
+        const st = (data as any)?.state as any;
+        const rawLatest = st?.agent_state?.latest_testcases_version ?? st?.latest_testcases_version;
+        const parsed = typeof rawLatest === 'number' ? rawLatest : parseInt(String(rawLatest ?? ''), 10);
+        if (!Number.isNaN(parsed)) {
+          setLatestTestcasesVersion(parsed);
+        }
       } catch {}
     };
     void loadStatus();
@@ -943,6 +1009,14 @@ export default function SuiteWorkspace() {
         (payload) => {
           const nextStatus = (payload.new as any)?.status as string | undefined;
           setAgentLoading(nextStatus === 'chatting' || nextStatus === 'running');
+          try {
+            const st = (payload.new as any)?.state as any;
+            const rawLatest = st?.agent_state?.latest_testcases_version ?? st?.latest_testcases_version;
+            const parsed = typeof rawLatest === 'number' ? rawLatest : parseInt(String(rawLatest ?? ''), 10);
+            if (!Number.isNaN(parsed)) {
+              setLatestTestcasesVersion(parsed);
+            }
+          } catch {}
         }
       )
       .subscribe();
@@ -1564,6 +1638,7 @@ export default function SuiteWorkspace() {
             onVersionAction={handleVersionAction}
             onViewHistory={() => setShowVersionHistory(true)}
             uploadedFiles={uploadedFiles}
+            latestTestcasesVersion={latestTestcasesVersion}
           />
           {initialChatLoading && (
             <div className="absolute inset-0 flex items-center justify-center bg-background/70 z-10">

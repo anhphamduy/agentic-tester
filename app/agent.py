@@ -60,7 +60,9 @@ _oai = OpenAI(api_key=global_settings.openai_api_key)  # uses OPENAI_API_KEY
 _results_writer = results_writer
 
 
-def make_team_for_suite(bound_suite_id: Optional[str], message_id: Optional[str] = None) -> Swarm:
+def make_team_for_suite(
+    bound_suite_id: Optional[str], message_id: Optional[str] = None
+) -> Swarm:
     suite_id_value = bound_suite_id or "unspecified"
 
     def store_docs_from_blob(doc_names: List[str]) -> Dict[str, Any]:
@@ -82,6 +84,31 @@ def make_team_for_suite(bound_suite_id: Optional[str], message_id: Optional[str]
             _write_text(docs_dir / name, text)
             stored.append(name)
         return {"stored": stored, "missing": missing}
+
+    def _update_suite_latest_version(new_version: int) -> None:
+        """Persist suite-level latest_version into test_suites.state while preserving existing agent_state.
+
+        - Reads prior agent_state via results_writer.get_suite_state (best-effort)
+        - If new_version is greater than existing latest_version, updates it
+        - Otherwise leaves state unchanged
+        """
+        try:
+            prior_state = _get_suite_agent_state(suite_id_value) or {}
+            prior_val = prior_state.get("latest_testcases_version")
+            try:
+                prior_int = int(prior_val) if prior_val is not None else None
+            except Exception:
+                prior_int = None
+            if prior_int is None or int(new_version) > prior_int:
+                merged_state = dict(prior_state)
+                merged_state["latest_testcases_version"] = int(new_version)
+                _write_full_suite_state(
+                    suite_id=suite_id_value,
+                    agent_state=merged_state,
+                    latest_version=int(new_version),
+                )
+        except Exception:
+            pass
 
     def extract_and_store_requirements() -> Dict[str, Any]:
         sdir = SESSIONS_ROOT / suite_id_value
@@ -161,7 +188,9 @@ Documents:
                 if isinstance(r, dict) and r.get("id")
             ]
             if not targets:
-                raise ValueError("No requirements available. Extract requirements first.")
+                raise ValueError(
+                    "No requirements available. Extract requirements first."
+                )
 
             def _worker(t: tuple[str, str, str]) -> Dict[str, Any]:
                 _rid, _src, _txt = t
@@ -178,7 +207,15 @@ Documents:
                         results.append(f.result())
                     except Exception as e:
                         errors.append({"req_id": _t[0], "error": str(e)})
-            return {"generated": len(results), "failed": len(errors), "results": results, "errors": errors}
+            # First generation implies suite-level version 1 if any were generated
+            if results:
+                _update_suite_latest_version(1)
+            return {
+                "generated": len(results),
+                "failed": len(errors),
+                "results": results,
+                "errors": errors,
+            }
 
         match = next(
             (r for r in reqs if isinstance(r, dict) and r.get("id") == req_id), None
@@ -236,14 +273,16 @@ Requirement text:
                     for c in cases:
                         if not isinstance(c, dict):
                             # Represent non-dict entries as a string row
-                            normalized_cases.append({
-                                "id": "",
-                                "type": "info",
-                                "title": str(c),
-                                "preconditions": "",
-                                "steps": str(c),
-                                "expected": ""
-                            })
+                            normalized_cases.append(
+                                {
+                                    "id": "",
+                                    "type": "info",
+                                    "title": str(c),
+                                    "preconditions": "",
+                                    "steps": str(c),
+                                    "expected": "",
+                                }
+                            )
                             continue
                         normalized_case = dict(c)
                         # Normalize list fields into single strings
@@ -299,6 +338,9 @@ Requirement text:
         except Exception:
             pass
 
+        # Ensure suite state reflects at least version 1 after initial generation
+        _update_suite_latest_version(1)
+
         return "Test cases generated successfully"
 
     def edit_testcases_for_req(user_edit_request: str) -> Dict[str, Any]:
@@ -313,6 +355,7 @@ Requirement text:
         - Embed the computed version inside each new_testcases content for robustness.
         - Return a compact payload including per-requirement versions and diffs.
         """
+
         # Local natural key sorter for human-friendly ordering like REQ-9 < REQ-10
         def _natural_key(value: Any):
             s = str(value or "")
@@ -322,8 +365,7 @@ Requirement text:
         # 1) Load requirements for this suite
         try:
             req_rows = (
-                supabase_client
-                .table("requirements")
+                supabase_client.table("requirements")
                 .select("id, req_code, content")
                 .eq("suite_id", suite_id_value)
                 .execute()
@@ -334,11 +376,16 @@ Requirement text:
             raise ValueError(f"Failed to load requirements: {e}")
 
         if not req_rows:
-            return {"status": "no_requirements", "message": "No requirements found for this suite."}
+            return {
+                "status": "no_requirements",
+                "message": "No requirements found for this suite.",
+            }
 
         # Sort requirements by requirement id (natural/lexicographic)
         try:
-            req_rows = sorted(req_rows, key=lambda r: _natural_key(r.get("id") or r.get("req_code")))
+            req_rows = sorted(
+                req_rows, key=lambda r: _natural_key(r.get("id") or r.get("req_code"))
+            )
         except Exception:
             pass
 
@@ -350,12 +397,14 @@ Requirement text:
             rid = r.get("id")
             rcode = r.get("req_code")
             rcontent = r.get("content") or {}
-            brief_requirements.append({
-                "requirement_id": rid,
-                "req_code": rcode,
-                "text": (rcontent or {}).get("text"),
-                "source": (rcontent or {}).get("source"),
-            })
+            brief_requirements.append(
+                {
+                    "requirement_id": rid,
+                    "req_code": rcode,
+                    "text": (rcontent or {}).get("text"),
+                    "source": (rcontent or {}).get("source"),
+                }
+            )
             if rid:
                 req_by_id[str(rid)] = r
             if rcode:
@@ -364,8 +413,7 @@ Requirement text:
         # 2) Load current test cases for this suite
         try:
             tc_rows = (
-                supabase_client
-                .table("test_cases")
+                supabase_client.table("test_cases")
                 .select("id, requirement_id, suite_id, content, version")
                 .eq("suite_id", suite_id_value)
                 .execute()
@@ -381,14 +429,20 @@ Requirement text:
             rid = str(row.get("requirement_id"))
             curr = latest_tc_by_req_id.get(rid)
             try:
-                row_ver = int(row.get("version")) if row.get("version") is not None else None
+                row_ver = (
+                    int(row.get("version")) if row.get("version") is not None else None
+                )
             except Exception:
                 row_ver = None
             if curr is None:
                 latest_tc_by_req_id[rid] = row
             else:
                 try:
-                    curr_ver = int(curr.get("version")) if curr.get("version") is not None else None
+                    curr_ver = (
+                        int(curr.get("version"))
+                        if curr.get("version") is not None
+                        else None
+                    )
                 except Exception:
                     curr_ver = None
                 if (row_ver or 0) >= (curr_ver or 0):
@@ -411,22 +465,30 @@ Requirement text:
                     cases = content.get("cases")
                     if isinstance(cases, list):
                         sorted_cases = sorted(
-                            cases,
-                            key=lambda c: _natural_key((c or {}).get("id"))
+                            cases, key=lambda c: _natural_key((c or {}).get("id"))
                         )
                         content = {**content, "cases": sorted_cases}
                 except Exception:
                     pass
-            brief_testcases.append({
-                "requirement_id": rid,
-                "req_code": (req_row or {}).get("req_code"),
-                "content": content,
-                "version": row.get("version"),
-            })
+            brief_testcases.append(
+                {
+                    "requirement_id": rid,
+                    "req_code": (req_row or {}).get("req_code"),
+                    "content": content,
+                    "version": row.get("version"),
+                }
+            )
 
-        # 3) Build LLM prompt
-        req_ctx = json.dumps(brief_requirements, ensure_ascii=False)
-        tc_ctx = json.dumps(brief_testcases, ensure_ascii=False)
+        # 3) Build LLM prompt (sorted by req_code, fallback to requirement_id)
+        brief_requirements_sorted = sorted(
+            brief_requirements, key=lambda r: _natural_key(r.get("req_code"))
+        )
+        brief_testcases_sorted = sorted(
+            brief_testcases, key=lambda r: _natural_key(r.get("req_code"))
+        )
+
+        req_ctx = json.dumps(brief_requirements_sorted, ensure_ascii=False)
+        tc_ctx = json.dumps(brief_testcases_sorted, ensure_ascii=False)
         if len(req_ctx) > 12000:
             req_ctx = req_ctx[:12000] + "\n...truncated..."
         if len(tc_ctx) > 12000:
@@ -438,28 +500,28 @@ Requirement text:
             "Schema may be dynamic; preserve unknown fields and structure.\n\n"
             "Return ONLY strict JSON (no markdown) with the following shape:\n"
             "{\n"
-            "  \"edits\": [\n"
+            '  "edits": [\n'
             "    {\n"
-            "      \"req_code\": \"<REQ-...>\",\n"
-            "      \"requirement_id\": \"<uuid or null>\",\n"
-            "      \"diff\": {\n"
-            "        \"added\": [<JSON case>],\n"
-            "        \"removed\": [<JSON case or identifier>],\n"
-            "        \"edited\": [{\n"
-            "          \"before\": <JSON case>,\n"
-            "          \"after\": <JSON case>,\n"
-            "          \"change_note\": \"<short note>\"\n"
+            '      "req_code": "<REQ-...>",\n'
+            '      "requirement_id": "<uuid or null>",\n'
+            '      "diff": {\n'
+            '        "added": [<JSON case>],\n'
+            '        "removed": [<JSON case or identifier>],\n'
+            '        "edited": [{\n'
+            '          "before": <JSON case>,\n'
+            '          "after": <JSON case>,\n'
+            '          "change_note": "<short note>"\n'
             "        }]\n"
             "      },\n"
-            "      \"new_testcases\": <FULL JSON for the updated test cases for this requirement>\n"
+            '      "new_testcases": <FULL JSON for the updated test cases for this requirement>\n'
             "    }\n"
             "  ],\n"
-            "  \"summary\": \"<1-2 sentences>\"\n"
+            '  "summary": "<1-2 sentences>"\n'
             "}\n\n"
             "Guidance:\n"
             "- Choose impacted requirements using req_code and/or requirement_id.\n"
             "- Keep steps/preconditions formatting consistent; do not drop unknown fields.\n"
-            "- If nothing applies, return \"edits\": [].\n\n"
+            '- If nothing applies, return "edits": [].\n\n'
             f"Requirements Context:\n{req_ctx}\n\n"
             f"Current Test Cases Context (latest per requirement):\n{tc_ctx}\n\n"
             f"User Edit Request:\n{user_edit_request}\n"
@@ -469,7 +531,10 @@ Requirement text:
             resp = _oai.chat.completions.create(
                 model=global_settings.openai_model,
                 messages=[
-                    {"role": "system", "content": "Return strict JSON only; no extra text."},
+                    {
+                        "role": "system",
+                        "content": "Return strict JSON only; no extra text.",
+                    },
                     {"role": "user", "content": prompt},
                 ],
                 reasoning_effort="minimal",
@@ -487,6 +552,7 @@ Requirement text:
 
         results: List[Dict[str, Any]] = []
         event_edits: List[Dict[str, Any]] = []
+        max_new_version_for_suite: Optional[int] = None
 
         # 4) Apply edits per requirement
         for e in edits:
@@ -505,13 +571,19 @@ Requirement text:
                 req_row = req_by_code[str(req_code)]
             if not req_row:
                 # Skip unknown requirement reference
-                event_edits.append({"req_code": req_code, "error": "requirement_not_found"})
+                event_edits.append(
+                    {"req_code": req_code, "error": "requirement_not_found"}
+                )
                 continue
 
             resolved_req_id = req_row.get("id")
             latest_row = latest_tc_by_req_id.get(str(resolved_req_id))
             try:
-                old_version = int((latest_row or {}).get("version")) if (latest_row or {}).get("version") is not None else None
+                old_version = (
+                    int((latest_row or {}).get("version"))
+                    if (latest_row or {}).get("version") is not None
+                    else None
+                )
             except Exception:
                 old_version = None
             new_version = (old_version or 1) + 1 if latest_row else 1
@@ -529,14 +601,15 @@ Requirement text:
             # Try versioned insert
             try:
                 res = (
-                    supabase_client
-                    .table("test_cases")
-                    .insert({
-                        "requirement_id": resolved_req_id,
-                        "suite_id": suite_id_value,
-                        "content": new_testcases,
-                        "version": new_version,
-                    })
+                    supabase_client.table("test_cases")
+                    .insert(
+                        {
+                            "requirement_id": resolved_req_id,
+                            "suite_id": suite_id_value,
+                            "content": new_testcases,
+                            "version": new_version,
+                        }
+                    )
                     .execute()
                 )
                 try:
@@ -548,20 +621,23 @@ Requirement text:
                 # Fallback to update/insert without version
                 try:
                     if latest_row and latest_row.get("id"):
-                        supabase_client.table("test_cases").update({
-                            "content": new_testcases,
-                            "suite_id": suite_id_value,
-                        }).eq("id", latest_row.get("id")).execute()
+                        supabase_client.table("test_cases").update(
+                            {
+                                "content": new_testcases,
+                                "suite_id": suite_id_value,
+                            }
+                        ).eq("id", latest_row.get("id")).execute()
                         inserted_row_id = latest_row.get("id")
                     else:
                         res2 = (
-                            supabase_client
-                            .table("test_cases")
-                            .insert({
-                                "requirement_id": resolved_req_id,
-                                "suite_id": suite_id_value,
-                                "content": new_testcases,
-                            })
+                            supabase_client.table("test_cases")
+                            .insert(
+                                {
+                                    "requirement_id": resolved_req_id,
+                                    "suite_id": suite_id_value,
+                                    "content": new_testcases,
+                                }
+                            )
                             .execute()
                         )
                         try:
@@ -571,22 +647,36 @@ Requirement text:
                 except Exception:
                     pass
 
-            results.append({
-                "requirement_id": resolved_req_id,
-                "req_code": req_row.get("req_code"),
-                "old_version": old_version or (1 if latest_row else 0),
-                "new_version": new_version,
-                "row_id": inserted_row_id,
-            })
-            event_edits.append({
-                "requirement_id": resolved_req_id,
-                "req_code": req_row.get("req_code"),
-                "diff": diff,
-                "new_testcases": new_testcases,
-                "old_version": old_version or (1 if latest_row else 0),
-                "new_version": new_version,
-                "row_id": inserted_row_id,
-            })
+            results.append(
+                {
+                    "requirement_id": resolved_req_id,
+                    "req_code": req_row.get("req_code"),
+                    "old_version": old_version or (1 if latest_row else 0),
+                    "new_version": new_version,
+                    "row_id": inserted_row_id,
+                }
+            )
+            event_edits.append(
+                {
+                    "requirement_id": resolved_req_id,
+                    "req_code": req_row.get("req_code"),
+                    "diff": diff,
+                    "new_testcases": new_testcases,
+                    "old_version": old_version or (1 if latest_row else 0),
+                    "new_version": new_version,
+                    "row_id": inserted_row_id,
+                }
+            )
+
+            # Track the highest new version across edits for suite-level state
+            try:
+                if (
+                    max_new_version_for_suite is None
+                    or int(new_version) > max_new_version_for_suite
+                ):
+                    max_new_version_for_suite = int(new_version)
+            except Exception:
+                pass
 
         # 5) Record one bulk event (best-effort)
         _results_writer.write_event(
@@ -601,6 +691,10 @@ Requirement text:
             message_id=message_id,
         )
 
+        # Update suite latest_version if any edits produced a new version
+        if max_new_version_for_suite is not None:
+            _update_suite_latest_version(max_new_version_for_suite)
+
         return {
             "edited_count": len(results),
             "results": results,
@@ -608,7 +702,9 @@ Requirement text:
             "status": "ok",
         }
 
-    def generate_preview(ask: str | None = None, preview_mode: Optional[str] = None) -> str:
+    def generate_preview(
+        ask: str | None = None, preview_mode: Optional[str] = None
+    ) -> str:
         """Generate a brief, free-form preview of requirements and/or test cases.
 
         Parameters:
@@ -666,12 +762,18 @@ Guidelines:
         resp = _oai.chat.completions.create(
             model=global_settings.openai_model,
             messages=[
-                {"role": "system", "content": "Return a compact, readable preview. No code blocks unless necessary."},
+                {
+                    "role": "system",
+                    "content": "Return a compact, readable preview. No code blocks unless necessary.",
+                },
                 {"role": "user", "content": prompt},
             ],
             reasoning_effort="minimal",
         )
-        return ask_user(event_type="sample_confirmation", response_to_user=resp.choices[0].message.content)
+        return ask_user(
+            event_type="sample_confirmation",
+            response_to_user=resp.choices[0].message.content,
+        )
 
     def generate_direct_testcases_on_docs(limit_per_doc: int = 6) -> str:
         """Generate concise test cases directly from the session docs without prior requirement extraction.
@@ -706,13 +808,20 @@ Documents:
 {bundle}
 """.strip()
 
-        resp = _oai.chat_completions.create if False else _oai.chat.completions.create(
-            model=global_settings.openai_model,
-            messages=[
-                {"role": "system", "content": "Return a compact, readable set of test cases. No unnecessary boilerplate."},
-                {"role": "user", "content": prompt},
-            ],
-            reasoning_effort="minimal",
+        resp = (
+            _oai.chat_completions.create
+            if False
+            else _oai.chat.completions.create(
+                model=global_settings.openai_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return a compact, readable set of test cases. No unnecessary boilerplate.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                reasoning_effort="minimal",
+            )
         )
         return resp.choices[0].message.content or ""
 
@@ -766,7 +875,10 @@ Documents:
             resp = _oai.chat.completions.create(
                 model=global_settings.openai_model,
                 messages=[
-                    {"role": "system", "content": "Return strict JSON only; no extra text."},
+                    {
+                        "role": "system",
+                        "content": "Return strict JSON only; no extra text.",
+                    },
                     {"role": "user", "content": prompt},
                 ],
                 reasoning_effort="minimal",
@@ -793,13 +905,18 @@ Documents:
                         lines.append(f"- {str(r)}")
                 if testing_type_needed:
                     lines.append("\nAdditional info needed:")
-                    lines.append(f"- {follow_up or 'Please choose a testing focus: Unit testing, Integration testing, or System testing.'}")
+                    lines.append(
+                        f"- {follow_up or 'Please choose a testing focus: Unit testing, Integration testing, or System testing.'}"
+                    )
                 # Append TERMINATE so the run stops per termination condition
                 lines.append("\nTERMINATE")
                 return "\n".join(lines)
             else:
                 if testing_type_needed:
-                    msg = follow_up or "Please choose a testing focus: Unit testing, Integration testing, or System testing."
+                    msg = (
+                        follow_up
+                        or "Please choose a testing focus: Unit testing, Integration testing, or System testing."
+                    )
                     return msg
                 return "No significant gaps detected in documents."
         except Exception as e:
@@ -814,7 +931,13 @@ Documents:
 
         Returns a payload that includes the token "TERMINATE" to trigger termination.
         """
-        allowed_types = {"sample_confirmation", "quality_confirmation", "requirements_feedback", "requirements_sample_offer", "testcases_sample_offer"}
+        allowed_types = {
+            "sample_confirmation",
+            "quality_confirmation",
+            "requirements_feedback",
+            "requirements_sample_offer",
+            "testcases_sample_offer",
+        }
         if event_type not in allowed_types:
             raise ValueError(f"Unsupported event_type: {event_type}")
 
@@ -827,9 +950,7 @@ Documents:
 
         try:
             _results_writer.write_event(
-                suite_id=suite_id_value,
-                event=event_payload,
-                message_id=message_id
+                suite_id=suite_id_value, event=event_payload, message_id=message_id
             )
         except Exception:
             # Swallow errors to avoid breaking the flow; termination should still occur
@@ -856,15 +977,18 @@ Documents:
         if not reqs:
             try:
                 data = (
-                    supabase_client
-                    .table("requirements")
+                    supabase_client.table("requirements")
                     .select("content")
                     .eq("suite_id", suite_id_value)
                     .execute()
                     .data
                     or []
                 )
-                reqs = [row.get("content") for row in data if isinstance(row.get("content"), dict)]
+                reqs = [
+                    row.get("content")
+                    for row in data
+                    if isinstance(row.get("content"), dict)
+                ]
             except Exception:
                 reqs = []
 
@@ -928,15 +1052,18 @@ Documents:
         testcases: List[Dict[str, Any]] = []
         try:
             data = (
-                supabase_client
-                .table("test_cases")
+                supabase_client.table("test_cases")
                 .select("content")
                 .eq("suite_id", suite_id_value)
                 .execute()
                 .data
                 or []
             )
-            testcases = [row.get("content") for row in data if isinstance(row.get("content"), dict)]
+            testcases = [
+                row.get("content")
+                for row in data
+                if isinstance(row.get("content"), dict)
+            ]
         except Exception:
             testcases = []
 
@@ -1002,7 +1129,13 @@ Documents:
         "planner",
         model_client=model_client,
         handoffs=["fetcher", "requirements_extractor", "testcase_writer"],
-        tools=[generate_preview, ask_user, get_requirements_info, get_testcases_info, identify_gaps],
+        tools=[
+            generate_preview,
+            ask_user,
+            get_requirements_info,
+            get_testcases_info,
+            identify_gaps,
+        ],
         system_message=(
             "You are the planner. Keep outputs tiny.\n"
             "Flow:\n"
@@ -1010,19 +1143,19 @@ Documents:
             "  2) Handoff to fetcher to load the docs.\n"
             "  4) Decide the path based on the user's original intent:\n"
             "     - If the ask requested to generate test cases from the document straight away:\n"
-            "       You must ask for a quality choice via ask_user(event_type=\\\"quality_confirmation\\\", response_to_user=\\\"Extract requirements first for better quality?\\\").\n"
+            '       You must ask for a quality choice via ask_user(event_type=\\"quality_confirmation\\", response_to_user=\\"Extract requirements first for better quality?\\").\n'
             "       On the next reply: if it's 'Yes please', handoff to requirements_extractor. If it's 'CONTINUE', handoff to testcase_writer to generate cases directly from docs.\n"
             "     - Otherwise (no explicit direct test-case request): handoff to requirements_extractor by default.\n"
             "     - If the user's request is to EDIT or UPDATE existing test cases (phrases like 'edit', 'update', 'revise', 'modify', 'tweak steps/titles/expected'):\n"
             "       Immediately handoff to testcase_writer to run edit_testcases_for_req(user_edit_request).\n"
-            "       If additional clarification is needed, ask the user to specify the scope or examples using ask_user(event_type=\\\"sample_confirmation\\\", response_to_user=\\\"Please describe which areas to adjust (titles, steps, expected outcomes, or specific requirements).\\\").\n"
-            "  5) After requirements_extractor finishes, it will ask ask_user(event_type=\\\"requirements_feedback\\\"). Wait for the next user reply.\n"
-            "     If the reply is 'CONTINUE', handoff to testcase_writer to generate full test cases; then summarize and write TERMINATE.\n"
-            "     If the reply indicates changes or hesitation (anything other than 'CONTINUE'), respond briefly and write TERMINATE.\n"
+            '       If additional clarification is needed, ask the user to specify the scope or examples using ask_user(event_type=\\"sample_confirmation\\", response_to_user=\\"Please describe which areas to adjust (titles, steps, expected outcomes, or specific requirements).\\").\n'
+            '  5) After requirements_extractor finishes, it will ask ask_user(event_type=\\"requirements_feedback\\"). Wait for the next user reply.\n'
+            "     If the reply is 'Generate test cases', handoff to testcase_writer to generate full test cases; then summarize and write TERMINATE.\n"
+            "     If the reply indicates changes or hesitation (anything other than 'Generate test cases'), respond briefly and write TERMINATE.\n"
             "  6) After testcase_writer finishes, respond briefly with a bit of content and the word TERMINATE\n"
-            "Notes: After fetcher loads the documents, RUN identify_gaps(). If gaps are found, you must return a short summary that includes the word TERMINATE to end the flow. If no gaps, proceed.\n"
+            "Notes: After fetcher loads the documents, RUN identify_gaps(). If gaps are found, you must return a short summary that includes the word TERMINATE to end the flow. If no gaps, proceed to the next steps.\n"
             "Also: Before handing off to requirements_extractor or testcase_writer, run generate_preview then ask_user sample_confirmation (after any quality_confirmation).\n"
-            "Always confirm immediate next steps with the user via ask_user BEFORE proceeding, EXCEPT when the user explicitly requests to edit test cases—then handoff directly to testcase_writer. For example: ask_user(event_type=\"quality_confirmation\", response_to_user=\"Should I extract requirements first for easier tracking before generating test cases?\").\n"
+            'Always confirm immediate next steps with the user via ask_user BEFORE proceeding, EXCEPT when the user explicitly requests to edit test cases—then handoff directly to testcase_writer. For example: ask_user(event_type="quality_confirmation", response_to_user="Should I extract requirements first for easier tracking before generating test cases?").\n'
             "If the user has specified a testing focus (e.g., unit or integration), call identify_gaps(testing_type=...). If not, identify_gaps will include 'testing_type_needed' and a follow-up prompt in its JSON/text output.\n"
             "If the user asks questions about existing requirements or test cases, use get_requirements_info(question=...) or get_testcases_info(question=...) to answer conciesly then write TERMINATE.\n"
             "If the user asks to edit test cases, you must handoff/transfer to testcase_writer.\n"
@@ -1049,7 +1182,7 @@ Documents:
         system_message=(
             "Call extract_and_store_requirements().\n"
             "Reply only: requirements_artifact.\n"
-            "Then call ask_user(event_type=\"requirements_feedback\", response_to_user=\"Requirements extracted. Proceed to generate test cases now?\") to request confirmation; this writes an event and TERMINATE.\n"
+            'Then call ask_user(event_type="requirements_feedback", response_to_user="Requirements extracted. Proceed to generate test cases now?") to request confirmation; this writes an event and TERMINATE.\n'
             "After every ask_user(...) call, immediately transfer back to planner (handoff to planner).\n"
             "If the user asks about requirements or test cases information at any time, do not answer; handoff to planner so it can respond using its info tools."
         ),
@@ -1059,13 +1192,18 @@ Documents:
         "testcase_writer",
         model_client=model_client,
         handoffs=["planner"],
-        tools=[generate_and_store_testcases_for_req, generate_direct_testcases_on_docs, edit_testcases_for_req],
+        tools=[
+            generate_and_store_testcases_for_req,
+            generate_direct_testcases_on_docs,
+            edit_testcases_for_req,
+        ],
         system_message=(
-            "If asked to generate test cases directly from docs, you must call generate_direct_testcases_on_docs() then transfer back to planner\n"
-            "Otherwise: If requirement id is not provided, call generate_and_store_testcases_for_req() to generate for ALL requirements concurrently (rate-limited).\n"
-            "If a specific requirement is provided, call generate_and_store_testcases_for_req(req_id).\n"
-            "If asked to edit test cases, call edit_testcases_for_req(user_edit_request) to compute diffs suite-wide and persist new versions.\n"
-            "Then handoff back to the planner.\n"
+            "You MUST call a tool to act. Never reply with free text.\n"
+            "- To generate directly from docs: call generate_direct_testcases_on_docs() and then handoff back to planner.\n"
+            "- To generate from extracted requirements: if no specific requirement id is provided, call generate_and_store_testcases_for_req() (all requirements, concurrently).\n"
+            "- If a specific requirement id is provided, call generate_and_store_testcases_for_req(req_id).\n"
+            "- To edit existing cases suite-wide, call edit_testcases_for_req(user_edit_request).\n"
+            "After any tool call, immediately handoff back to planner.\n"
             "If the user asks about test cases or requirements information, do not answer; handoff to planner so it can respond using its info tools."
         ),
     )
@@ -1088,7 +1226,7 @@ model_client = OpenAIChatCompletionClient(
     model=global_settings.openai_model,
     parallel_tool_calls=False,
     api_key=global_settings.openai_api_key,
-    reasoning_effort = "minimal"
+    reasoning_effort="minimal",
 )
 
 # Global termination condition
@@ -1109,24 +1247,69 @@ def _get_suite_agent_state(suite_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: Optional[str] = None):
+def _write_full_suite_state(
+    suite_id: Optional[str],
+    agent_state: Dict[str, Any],
+    latest_version: Optional[int] = None,
+) -> None:
+    """Write both agent_state and a top-level latest_testcases_version into test_suites.state.
+
+    - Reads existing state to merge.
+    - Preserves other keys.
+    - If latest_version is provided, writes it to top-level as latest_testcases_version.
+    """
+    if not suite_id:
+        return
+    try:
+        data = (
+            supabase_client.table("test_suites")
+            .select("id, state")
+            .eq("id", suite_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        current: Dict[str, Any] = {}
+        if data:
+            existing = data[0].get("state")
+            if isinstance(existing, dict):
+                current = existing
+        current["agent_state"] = agent_state
+        if latest_version is not None:
+            try:
+                current["latest_testcases_version"] = int(latest_version)
+            except Exception:
+                pass
+        supabase_client.table("test_suites").update({"state": current}).eq(
+            "id", suite_id
+        ).execute()
+    except Exception as e:
+        print(f"Error writing suite state: {e}")
+
+
+async def run_stream_with_suite(
+    task: str, suite_id: Optional[str], message_id: Optional[str] = None
+):
     _message_id = message_id or str(uuid4())
     local_team = make_team_for_suite(suite_id, _message_id)
     # Mark suite as chatting/running (best-effort)
     try:
         if suite_id:
-            supabase_client.table("test_suites").update({"status": "chatting"}).eq("id", suite_id).execute()
+            supabase_client.table("test_suites").update({"status": "chatting"}).eq(
+                "id", suite_id
+            ).execute()
     except Exception as e:
         print(e)
     # Best-effort: load prior team state if the suite exists and has stored state
     try:
-        prior_state = _get_suite_agent_state(suite_id)
+        prior_state = _get_suite_agent_state(suite_id)["agent_state"]
         if prior_state:
             await local_team.load_state(prior_state)
     except Exception as e:
         # Do not block execution if state loading fails
         print(f"Error loading team state: {e}")
-    
+
     async for event in local_team.run_stream(task=task):
         print(event)
         try:
@@ -1140,11 +1323,27 @@ async def run_stream_with_suite(task: str, suite_id: Optional[str], message_id: 
             pass
         yield event
 
-    _results_writer.write_suite_state(suite_id=suite_id, state=await local_team.save_state())
+    # Persist both agent_state and top-level latest_testcases_version (if present in agent_state)
+    try:
+        saved_state = await local_team.save_state()
+        # If the saved_state carries a latest marker, set it at top-level too
+        latest_marker = None
+        try:
+            lv = saved_state.get("latest_testcases_version")
+            latest_marker = int(lv) if lv is not None else None
+        except Exception:
+            latest_marker = None
+        _write_full_suite_state(
+            suite_id=suite_id, agent_state=saved_state, latest_version=latest_marker
+        )
+    except Exception as e:
+        print(f"Error saving suite state: {e}")
     # Back to idle when finished (best-effort)
     try:
         if suite_id:
-            supabase_client.table("test_suites").update({"status": "idle"}).eq("id", suite_id).execute()
+            supabase_client.table("test_suites").update({"status": "idle"}).eq(
+                "id", suite_id
+            ).execute()
     except Exception as e:
         print(f"Error updating suite status to idle: {e}")
 
