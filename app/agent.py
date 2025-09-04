@@ -31,6 +31,7 @@ _blob_storage = blob_storage
 
 # In-memory per-suite cache for generated requirements (avoids filesystem writes)
 _SUITE_REQUIREMENTS: Dict[str, List[Dict[str, Any]]] = {}
+_SUITE_TEST_DESIGN_ID: Dict[str, str] = {}
 
 
 def _write_text(path: Path, text: str) -> str:
@@ -922,6 +923,244 @@ Documents:
         except Exception as e:
             return f"Gap analysis error: {e}"
 
+    def generate_test_design() -> str:
+        """Generate Integration Testing Test Design artifacts as STRICT JSON.
+
+        Inputs:
+        - Requirement list (from in-memory cache or DB)
+        - Uploaded .txt documents for additional context
+
+        Output JSON shape (no status fields):
+        {
+          "sitemap_mermaid": "mermaid\nflowchart TD\n...",
+          "flows": [
+            {
+              "id": "IT-FLOW-01",
+              "name": "...",
+              "requirements_linked": ["REQ-1", "REQ-2"],
+              "description": "A → B → C",
+              "diagram_mermaid": "mermaid\nflowchart TD\n..."
+            }
+          ],
+          "clarifying_questions": ["..."],
+          "notes": "..."
+        }
+        """
+        # Gather requirements (from cache, then DB best-effort)
+        reqs = _SUITE_REQUIREMENTS.get(suite_id_value)
+        if not reqs:
+            try:
+                data = (
+                    supabase_client.table("requirements")
+                    .select("req_code, content")
+                    .eq("suite_id", suite_id_value)
+                    .execute()
+                    .data
+                    or []
+                )
+                reqs = []
+                for row in data:
+                    content = row.get("content") or {}
+                    if isinstance(content, dict):
+                        # normalize minimal fields for context
+                        reqs.append(
+                            {
+                                "id": content.get("id") or row.get("req_code"),
+                                "text": content.get("text"),
+                                "source": content.get("source"),
+                            }
+                        )
+            except Exception:
+                reqs = []
+
+        # Read docs context
+        sdir = SESSIONS_ROOT / suite_id_value
+        docs_dir = sdir / "docs"
+        blocks: List[str] = []
+        for p in sorted(docs_dir.glob("*.txt")):
+            try:
+                txt = _read_text(p, max_chars=16_000)
+            except Exception:
+                txt = ""
+            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
+        docs_bundle = "\n\n".join(blocks) if blocks else ""
+
+        # Build prompt from user specification
+        req_ctx = json.dumps(reqs or [], ensure_ascii=False)
+        if len(req_ctx) > 12_000:
+            req_ctx = req_ctx[:12_000] + "\n...truncated..."
+
+        prompt = (
+            "Integration Testing Test Design Specification\n\n"
+            "Role & Task\n"
+            "You are an expert test designer for Integration Testing (IT).\n"
+            "Your task is to create test design artifacts (Sitemap + Screen Flow Diagrams) based on the Requirement List and the uploaded Requirement Documents.\n\n"
+            "Steps to Follow\n"
+            "1. Input Understanding\n"
+            "   - Read the provided Requirement List (grouped into Features → Functions → Screens).\n"
+            "   - Cross-check with the uploaded Requirement Documents.\n"
+            "2. Summarized but Not Limited to Requirements\n"
+            "   - Summarize requirements into Integration Flows.\n"
+            "   - If requirements are unclear → raise clarifying questions.\n"
+            "   - Suggest additional flows where needed for full business coverage.\n"
+            "3. Output Format (Mandatory)\n"
+            "   - Return STRICT JSON ONLY with the following shape:\n"
+            "   {\n"
+            "     \"sitemap_mermaid\": \"mermaid\\nflowchart TD\\n...\",\n"
+            "     \"flows\": [\n"
+            "       {\n"
+            "         \"id\": \"IT-FLOW-01\",\n"
+            "         \"name\": \"...\",\n"
+            "         \"requirements_linked\": [\"REQ-1\"],\n"
+            "         \"description\": \"A → B → C\",\n"
+            "         \"diagram_mermaid\": \"mermaid\\nflowchart TD\\n...\"\n"
+            "       }\n"
+            "     ],\n"
+            "     \"clarifying_questions\": [],\n"
+            "     \"notes\": \"\"\n"
+            "   }\n\n"
+            "Clarity & Traceability\n"
+            "- Every flow must map to Requirement IDs (use the IDs from the list).\n"
+            "- You may include suggested flows if needed for coverage, but do not add a status field.\n"
+            "- Keep diagrams simple.\n\n"
+            f"Requirement List (JSON):\n{req_ctx}\n\n"
+            f"Documents:\n{docs_bundle}\n"
+        )
+
+        resp = _oai.chat.completions.create(
+            model=global_settings.openai_model,
+            messages=[
+                {"role": "system", "content": "Return strict JSON only; no extra text."},
+                {"role": "user", "content": prompt},
+            ],
+            reasoning_effort="minimal",
+        )
+        raw = resp.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+            assert isinstance(data, dict)
+            # Persist best-effort
+            try:
+                test_design_id = _results_writer.write_test_design(
+                    session_id=suite_id_value,
+                    suite_id=suite_id_value,
+                    content=data,
+                    testing_type="integration",
+                )
+                if test_design_id:
+                    _SUITE_TEST_DESIGN_ID[suite_id_value] = str(test_design_id)
+            except Exception:
+                pass
+            return json.dumps(data, ensure_ascii=False)
+        except Exception as e:
+            raise ValueError(f"Invalid JSON from test design generator: {e}")
+
+    def generate_viewpoints(style: str = "json") -> Any:
+        """Generate per-requirement Test Viewpoints (no status field).
+
+        Definition: A test viewpoint is the perspective or focus area that helps
+        test engineers grasp the big picture of the test design. Viewpoints are
+        abstractions and the source of test cases. Types vary by organization and test.
+
+        Returns JSON by default with shape (no status field in items):
+        {
+          "viewpoints": [
+            {
+              "req_code": "REQ-1",
+              "req_text": "...",
+              "items": [
+                {"name": "Functional", "rationale": "..."},
+                {"name": "Security", "rationale": "..."}
+              ]
+            }
+          ],
+          "summary": "short overview"
+        }
+        """
+        # Gather requirements
+        reqs = _SUITE_REQUIREMENTS.get(suite_id_value)
+        if not reqs:
+            try:
+                data = (
+                    supabase_client.table("requirements")
+                    .select("req_code, content")
+                    .eq("suite_id", suite_id_value)
+                    .execute()
+                    .data
+                    or []
+                )
+                reqs = []
+                for row in data:
+                    content = row.get("content") or {}
+                    if isinstance(content, dict):
+                        reqs.append(
+                            {
+                                "id": content.get("id") or row.get("req_code"),
+                                "text": content.get("text"),
+                                "source": content.get("source"),
+                            }
+                        )
+            except Exception:
+                reqs = []
+
+        sdir = SESSIONS_ROOT / suite_id_value
+        docs_dir = sdir / "docs"
+        blocks: List[str] = []
+        for p in sorted(docs_dir.glob("*.txt")):
+            try:
+                txt = _read_text(p, max_chars=10_000)
+            except Exception:
+                txt = ""
+            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
+        docs_bundle = "\n\n".join(blocks) if blocks else ""
+
+        req_ctx = json.dumps(reqs or [], ensure_ascii=False)
+        if len(req_ctx) > 10_000:
+            req_ctx = req_ctx[:10_000] + "\n...truncated..."
+
+        prompt = (
+            "You are a senior test designer. Create per-requirement TEST VIEWPOINTS for Integration Testing.\n"
+            "Definition: Test viewpoint is a point where test engineers focus attention to grasp the big picture of test design — it is an abstraction and a source of test cases. Types of test viewpoints depend on organizations and/or test.\n\n"
+            "Guidelines:\n"
+            "- Use common categories when relevant: Functional, Data Validation, Error Handling, Security/Privacy, Roles/Permissions/Access Control, Integration Interfaces/APIs, Performance/Scalability, Usability/UX, State/Workflow, Configuration/Environment.\n"
+            "- For each requirement, list 3–7 most relevant viewpoints.\n"
+            "- Do not include any status field.\n"
+            "- Provide a one-line rationale per viewpoint to aid traceability.\n"
+            "- Ensure coverage breadth but keep it concise.\n\n"
+            "Return STRICT JSON ONLY with this shape:\n"
+            "{\n  \"viewpoints\": [\n    {\n      \"req_code\": \"REQ-1\",\n      \"req_text\": \"...\",\n      \"items\": [\n        {\"name\": \"Functional\", \"rationale\": \"...\"}\n      ]\n    }\n  ],\n  \"summary\": \"<short>\"\n}\n\n"
+            f"Requirement List (JSON):\n{req_ctx}\n\n"
+            f"Documents:\n{docs_bundle}\n"
+        )
+
+        resp = _oai.chat.completions.create(
+            model=global_settings.openai_model,
+            messages=[
+                {"role": "system", "content": "Return strict JSON only; no extra text."},
+                {"role": "user", "content": prompt},
+            ],
+            reasoning_effort="minimal",
+        )
+        raw = resp.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+            assert isinstance(data, dict)
+            # Persist best-effort (store JSON content and link to latest test design if available)
+            try:
+                _results_writer.write_viewpoints(
+                    session_id=suite_id_value,
+                    suite_id=suite_id_value,
+                    content=data,
+                    test_design_id=_SUITE_TEST_DESIGN_ID.get(suite_id_value),
+                    testing_type="integration",
+                )
+            except Exception:
+                pass
+            # Always return a JSON string for UI rendering and downstream parsing
+            return json.dumps(data, ensure_ascii=False)
+        except Exception as e:
+            raise ValueError(f"Invalid JSON from viewpoints generator: {e}")
+
     def ask_user(event_type: str, response_to_user: str) -> Dict[str, Any]:
         """Log a user-facing question to events and terminate the flow.
 
@@ -1178,11 +1417,12 @@ Documents:
         "requirements_extractor",
         model_client=model_client,
         handoffs=["testcase_writer", "planner"],
-        tools=[extract_and_store_requirements, ask_user],
+        tools=[extract_and_store_requirements, generate_test_design, generate_viewpoints, ask_user],
         system_message=(
             "Call extract_and_store_requirements().\n"
             "Reply only: requirements_artifact.\n"
-            'Then call ask_user(event_type="requirements_feedback", response_to_user="Requirements extracted. Proceed to generate test cases now?") to request confirmation; this writes an event and TERMINATE.\n'
+            "Next, generate Integration Testing artifacts: call generate_test_design() and generate_viewpoints().\n"
+            'Then call ask_user(event_type="requirements_feedback", response_to_user="Requirements extracted and test design + viewpoints prepared. Proceed to generate test cases now?") to request confirmation; this writes an event and TERMINATE.\n'
             "After every ask_user(...) call, immediately transfer back to planner (handoff to planner).\n"
             "If the user asks about requirements or test cases information at any time, do not answer; handoff to planner so it can respond using its info tools."
         ),

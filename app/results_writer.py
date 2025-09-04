@@ -54,6 +54,29 @@ class ResultsWriter:
         """
         raise NotImplementedError
 
+    # New: persist Integration Test Design JSON
+    def write_test_design(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        content: Dict[str, Any],
+        testing_type: str = "integration",
+    ) -> Optional[str]:
+        raise NotImplementedError
+
+    # New: persist per-requirement viewpoints linked to test_design and requirement
+    def write_viewpoints(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        content: Dict[str, Any],
+        test_design_id: Optional[str],
+        testing_type: str = "integration",
+    ) -> List[str]:
+        raise NotImplementedError
+
 
 class NoopResultsWriter(ResultsWriter):
     def write_requirements(
@@ -98,6 +121,27 @@ class NoopResultsWriter(ResultsWriter):
         suite_id: Optional[str],
     ) -> Optional[Dict[str, Any]]:
         return None
+
+    def write_test_design(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        content: Dict[str, Any],
+        testing_type: str = "integration",
+    ) -> Optional[str]:
+        return None
+
+    def write_viewpoints(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        content: Dict[str, Any],
+        test_design_id: Optional[str],
+        testing_type: str = "integration",
+    ) -> List[str]:
+        return []
 
 
 class SupabaseResultsWriter(ResultsWriter):
@@ -279,3 +323,65 @@ class SupabaseResultsWriter(ResultsWriter):
             return None
         state_obj = data[0].get("state")
         return state_obj
+
+    def write_test_design(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        content: Dict[str, Any],
+        testing_type: str = "integration",
+    ) -> Optional[str]:
+        row = {
+            "suite_id": suite_id,
+            "testing_type": testing_type,
+            "content": content,
+        }
+        res = self._client.table("test_designs").insert(row).execute()
+        try:
+            return ((res.data or [])[0] or {}).get("id")
+        except Exception:
+            return None
+
+    def write_viewpoints(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        content: Dict[str, Any],
+        test_design_id: Optional[str],
+        testing_type: str = "integration",
+    ) -> List[str]:
+        inserted_ids: List[str] = []
+        vp_groups = content.get("viewpoints") if isinstance(content, dict) else None
+        if not isinstance(vp_groups, list):
+            return inserted_ids
+        for group in vp_groups:
+            if not isinstance(group, dict):
+                continue
+            req_code = group.get("req_code")
+            items = group.get("items") if isinstance(group.get("items"), list) else []
+            requirement_id = None
+            if req_code:
+                requirement_id = self._get_requirement_row_id(
+                    suite_id=suite_id, req_code=str(req_code)
+                )
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                row = {
+                    "suite_id": suite_id,
+                    "test_design_id": test_design_id,
+                    "requirement_id": requirement_id,
+                    "name": it.get("name"),
+                    "rationale": it.get("rationale"),
+                    "content": it,
+                }
+                res = self._client.table("viewpoints").insert(row).execute()
+                try:
+                    rid = ((res.data or [])[0] or {}).get("id")
+                    if rid:
+                        inserted_ids.append(rid)
+                except Exception:
+                    pass
+        return inserted_ids

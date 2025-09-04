@@ -160,3 +160,114 @@ EXECUTE FUNCTION public.test_cases_set_next_version();
 
 ALTER TABLE test_cases
 DROP CONSTRAINT test_cases_requirement_id_key;
+
+-- 001_create_test_designs_and_viewpoints.sql
+
+-- Create enum for testing_type if useful across artifacts
+do $$
+begin
+  if not exists (select 1 from pg_type where typname = 'testing_type_enum') then
+    create type testing_type_enum as enum ('integration', 'unit', 'system');
+  end if;
+end$$;
+
+-- test_designs table: stores one JSON document per generated design
+create table if not exists public.test_designs (
+  id uuid primary key default gen_random_uuid(),
+  suite_id uuid references public.test_suites(id) on delete cascade,
+  testing_type testing_type_enum not null default 'integration',
+  content jsonb not null, -- strict JSON from LLM: { sitemap_mermaid, flows[], ... }
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_test_designs_suite_id on public.test_designs(suite_id);
+create index if not exists idx_test_designs_testing_type on public.test_designs(testing_type);
+
+-- viewpoints table: one row per viewpoint item linked to requirement and test_design
+create table if not exists public.viewpoints (
+  id uuid primary key default gen_random_uuid(),
+  suite_id uuid references public.test_suites(id) on delete cascade,
+  test_design_id uuid references public.test_designs(id) on delete set null,
+  requirement_id uuid references public.requirements(id) on delete set null,
+  name text not null,
+  rationale text,
+  status text, -- 'Requirement' | 'Suggested' or org-specific status
+  content jsonb, -- full raw item as produced by LLM for future-proofing
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_viewpoints_suite_id on public.viewpoints(suite_id);
+create index if not exists idx_viewpoints_test_design_id on public.viewpoints(test_design_id);
+create index if not exists idx_viewpoints_requirement_id on public.viewpoints(requirement_id);
+
+-- Optional view to quickly get viewpoints with requirement code and suite
+create or replace view public.viewpoints_with_req as
+select
+  v.id as viewpoint_id,
+  v.name,
+  v.status,
+  v.rationale,
+  v.suite_id,
+  v.test_design_id,
+  v.requirement_id,
+  r.req_code,
+  v.content,
+  v.created_at
+from public.viewpoints v
+left join public.requirements r on r.id = v.requirement_id;
+
+-- Optional RLS: enable if you already use RLS on your schema
+-- alter table public.test_designs enable row level security;
+-- alter table public.viewpoints enable row level security;
+-- Then add suitable policies consistent with existing ones (omitted here).
+
+-- 002_drop_status_from_test_designs_and_viewpoints.sql
+
+-- If you previously added a status column to viewpoints, drop it
+do $$
+begin
+  if exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public' and table_name = 'viewpoints' and column_name = 'status'
+  ) then
+    alter table public.viewpoints drop column status cascade;
+  end if;
+end$$;
+
+-- No separate status column in test_designs; flows were inside JSON.
+-- Optional: clean any embedded \"status\" keys from existing JSON content for consistency.
+
+-- Remove status inside viewpoints.content JSON, if present
+update public.viewpoints
+set content = content - 'status'
+where content ? 'status';
+
+-- Remove status within test_designs.content.flows[*] JSON objects
+-- This updates each flow object to strip the 'status' key.
+with updated as (
+  select
+    id,
+    jsonb_set(
+      content,
+      '{flows}',
+      coalesce(
+        (
+          select jsonb_agg(
+            case when jsonb_typeof(f) = 'object' then f - 'status' else f end
+          )
+          from jsonb_array_elements(content->'flows') as f
+        ),
+        '[]'::jsonb
+      )
+    ) as new_content
+  from public.test_designs
+  where content ? 'flows'
+)
+update public.test_designs td
+set content = u.new_content
+from updated u
+where td.id = u.id;
+
+-- Optional indexes (no-op if they already exist)
+create index if not exists idx_viewpoints_requirement_id on public.viewpoints(requirement_id);
+create index if not exists idx_viewpoints_test_design_id on public.viewpoints(test_design_id);
+create index if not exists idx_test_designs_suite_id on public.test_designs(suite_id);

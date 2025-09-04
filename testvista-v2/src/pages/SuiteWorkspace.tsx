@@ -114,8 +114,10 @@ export default function SuiteWorkspace() {
   const [traceabilityLinks, setTraceabilityLinks] = useState<TraceabilityLink[]>([]);
   const [dynamicRequirementsRows, setDynamicRequirementsRows] = useState<any[]>([]);
   const [dynamicTestCaseRows, setDynamicTestCaseRows] = useState<any[]>([]);
+  const [dynamicTestDesignRows, setDynamicTestDesignRows] = useState<any[]>([]);
+  const [dynamicTestViewpointRows, setDynamicTestViewpointRows] = useState<any[]>([]);
   const [agentLoading, setAgentLoading] = useState(false);
-  const [activeArtifactsTab, setActiveArtifactsTab] = useState<"requirements" | "viewpoints" | "testcases">("requirements");
+  const [activeArtifactsTab, setActiveArtifactsTab] = useState<"requirements" | "viewpoints" | "testcases" | "test_design" | "test_viewpoints">("requirements");
   const [initialChatLoading, setInitialChatLoading] = useState(true);
   const hasLoadedChatOnce = useRef(false);
   const loadTeamEvents = async () => {
@@ -450,6 +452,12 @@ export default function SuiteWorkspace() {
       if (source === 'testcase_writer' && name === 'generate_direct_testcases_on_docs') {
         return { role: 'ai', content: `I'm generating test cases directly from your documents...` };
       }
+      if (source === 'requirements_extractor' && name === 'generate_test_design') {
+        return { role: 'ai', content: `I'm preparing integration test design (sitemap + flows)...` };
+      }
+      if (source === 'requirements_extractor' && name === 'generate_viewpoints') {
+        return { role: 'ai', content: `I'm generating per-requirement test viewpoints...` };
+      }
       if (source === 'planner' && name === 'transfer_to_fetcher') {
         return null;
       }
@@ -521,6 +529,40 @@ export default function SuiteWorkspace() {
       if (source === 'testcase_writer' && name === 'generate_direct_testcases_on_docs') {
         const details = normalizeMarkdown(String(first?.content ?? ''));
         return { role: 'ai', content: details || 'Generated direct test cases.' };
+      }
+      if (source === 'requirements_extractor' && name === 'generate_test_design') {
+        const raw = String(first?.content ?? '');
+        try {
+          const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          const flows = Array.isArray(parsed?.flows) ? parsed.flows : [];
+          const flowCount = flows.length;
+          const sample = flows[0] || {};
+          const sampleName = sample?.name || sample?.id || '';
+          const header = flowCount ? `Integration test design ready with ${flowCount} flows.` : 'Integration test design generated.';
+          const tail = sampleName ? ` Example: ${sampleName}.` : '';
+          return { role: 'ai', content: `${header}${tail}` };
+        } catch {
+          const details = normalizeMarkdown(raw);
+          return { role: 'ai', content: details || 'Integration test design generated.' };
+        }
+      }
+      if (source === 'requirements_extractor' && name === 'generate_viewpoints') {
+        const raw = String(first?.content ?? '');
+        try {
+          const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          const items = Array.isArray(parsed?.viewpoints) ? parsed.viewpoints : [];
+          const reqCount = items.length;
+          const sample = items[0] || {};
+          const reqCode = sample?.req_code || sample?.requirement_id || '';
+          const vp = Array.isArray(sample?.items) ? sample.items : [];
+          const names = vp.slice(0, 3).map((x: any) => x?.name).filter(Boolean).join(', ');
+          const header = reqCount ? `Generated viewpoints for ${reqCount} requirement(s).` : 'Generated viewpoints.';
+          const tail = reqCode && names ? ` Example (${reqCode}): ${names}.` : '';
+          return { role: 'ai', content: `${header}${tail}` };
+        } catch {
+          const details = normalizeMarkdown(raw);
+          return { role: 'ai', content: details || 'Generated viewpoints.' };
+        }
       }
       if (source === 'planner' && name === 'transfer_to_fetcher') {
         return null;
@@ -820,9 +862,16 @@ export default function SuiteWorkspace() {
         const suiteIdParam = new URLSearchParams(window.location.search).get('suiteId');
         const suiteIdVal = id || suiteIdParam || undefined;
         if (!suiteIdVal) return;
-        const [{ data: reqs }, { data: tcs }] = await Promise.all([
+        const [
+          { data: reqs },
+          { data: tcs },
+          { data: tds },
+          { data: tvps }
+        ] = await Promise.all([
           supabase.from('requirements').select('*').eq('suite_id', suiteIdVal),
           supabase.from('test_cases').select('*').eq('suite_id', suiteIdVal),
+          supabase.from('test_designs').select('*').eq('suite_id', suiteIdVal),
+          supabase.from('viewpoints').select('*').eq('suite_id', suiteIdVal),
         ]);
         setDynamicRequirementsRows(sortRequirementsByReqCode(reqs || []));
         {
@@ -830,6 +879,8 @@ export default function SuiteWorkspace() {
           const latestOnly = filterLatestTestcasesByRequirement(flattened);
           setDynamicTestCaseRows(sortTestCasesByReqThenId(latestOnly));
         }
+        setDynamicTestDesignRows(tds || []);
+        setDynamicTestViewpointRows(tvps || []);
       } catch (e) {
         console.error('Failed to fetch dynamic artifacts', e);
       } finally {
@@ -964,6 +1015,36 @@ export default function SuiteWorkspace() {
             setActiveArtifactsTab('testcases');
           } catch (e) {
             console.error('Failed to refresh test cases (realtime)', e);
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'test_designs', filter: `suite_id=eq.${suiteIdVal}` },
+        async () => {
+          try {
+            const { data } = await supabase
+              .from('test_designs')
+              .select('*')
+              .eq('suite_id', suiteIdVal);
+            setDynamicTestDesignRows(data || []);
+          } catch (e) {
+            console.error('Failed to refresh test designs (realtime)', e);
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'viewpoints', filter: `suite_id=eq.${suiteIdVal}` },
+        async () => {
+          try {
+            const { data } = await supabase
+              .from('viewpoints')
+              .select('*')
+              .eq('suite_id', suiteIdVal);
+            setDynamicTestViewpointRows(data || []);
+          } catch (e) {
+            console.error('Failed to refresh viewpoints (realtime)', e);
           }
         }
       )
@@ -1657,6 +1738,8 @@ export default function SuiteWorkspace() {
             onActiveTabChange={setActiveArtifactsTab}
             dynamicRequirementsRows={dynamicRequirementsRows}
             dynamicTestCaseRows={dynamicTestCaseRows}
+            dynamicTestDesignRows={dynamicTestDesignRows}
+            dynamicTestViewpointRows={dynamicTestViewpointRows}
             loadingStates={loadingStates}
             agentLoading={agentLoading}
             onUpdateRequirement={handleUpdateRequirement} 

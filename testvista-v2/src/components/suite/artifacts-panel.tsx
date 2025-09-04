@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -104,8 +104,10 @@ interface ArtifactsPanelProps {
   testCases: TestCase[];
   dynamicRequirementsRows?: any[];
   dynamicTestCaseRows?: any[];
-  activeTab?: "requirements" | "viewpoints" | "testcases";
-  onActiveTabChange?: (tab: "requirements" | "viewpoints" | "testcases") => void;
+  dynamicTestDesignRows?: any[];
+  dynamicTestViewpointRows?: any[];
+  activeTab?: "requirements" | "viewpoints" | "testcases" | "test_design" | "test_viewpoints";
+  onActiveTabChange?: (tab: "requirements" | "viewpoints" | "testcases" | "test_design" | "test_viewpoints") => void;
   onUpdateRequirement: (
     id: string,
     data: Partial<Requirement>,
@@ -149,6 +151,8 @@ export function ArtifactsPanel({
   testCases,
   dynamicRequirementsRows = [],
   dynamicTestCaseRows = [],
+  dynamicTestDesignRows = [],
+  dynamicTestViewpointRows = [],
   activeTab: activeTabProp,
   onActiveTabChange,
   onUpdateRequirement,
@@ -163,9 +167,9 @@ export function ArtifactsPanel({
   loadingStates = {},
   agentLoading = false,
 }: ArtifactsPanelProps) {
-  const [internalTab, setInternalTab] = useState<"requirements" | "viewpoints" | "testcases">("requirements");
+  const [internalTab, setInternalTab] = useState<"requirements" | "viewpoints" | "testcases" | "test_design" | "test_viewpoints">("requirements");
   const activeTab = activeTabProp ?? internalTab;
-  const handleTabChange = (val: "requirements" | "viewpoints" | "testcases") => {
+  const handleTabChange = (val: "requirements" | "viewpoints" | "testcases" | "test_design" | "test_viewpoints") => {
     if (onActiveTabChange) onActiveTabChange(val);
     else setInternalTab(val);
   };
@@ -174,6 +178,47 @@ export function ArtifactsPanel({
   const reqCount = dynamicRequirementsRows.length ? dynamicRequirementsRows.length : requirements.length;
   const tcCount = dynamicTestCaseRows.length ? dynamicTestCaseRows.length : testCases.length;
   const vpCount = viewpoints.length;
+  const tdFlowRows = useMemo(() => {
+    const parseContent = (v: any): Record<string, any> => {
+      if (v == null) return {};
+      if (typeof v === "string") {
+        try { return JSON.parse(v); } catch { return { value: v }; }
+      }
+      if (typeof v === "object") return v as Record<string, any>;
+      return { value: v };
+    };
+    const rows: any[] = [];
+    (dynamicTestDesignRows || []).forEach((r: any) => {
+      const content = parseContent(r?.content);
+      const flows = Array.isArray(content?.flows) ? content.flows : [];
+      flows.forEach((f: any, idx: number) => {
+        if (f && typeof f === "object") {
+          const reqs = Array.isArray(f?.requirements_linked)
+            ? f.requirements_linked.join(", ")
+            : (Array.isArray(f?.requirements) ? f.requirements.join(", ") : (f?.requirements_linked ?? f?.requirements ?? ""));
+          rows.push({ ...f, requirements_linked: reqs, test_design_id: r?.id, created_at: r?.created_at });
+        } else {
+          rows.push({ id: `${r?.id || "TD"}-FLOW-${idx + 1}`, value: String(f), test_design_id: r?.id, created_at: r?.created_at });
+        }
+      });
+    });
+    return rows;
+  }, [dynamicTestDesignRows]);
+  const tdFlowCount = tdFlowRows.length;
+  const dbVpCount = dynamicTestViewpointRows.length;
+
+  // Ensure we don't stay on hidden tabs when they have no records
+  useEffect(() => {
+    if (activeTab === "viewpoints" && vpCount === 0) {
+      handleTabChange("requirements");
+    }
+    if (activeTab === "test_design" && tdFlowCount === 0) {
+      handleTabChange("requirements");
+    }
+    if (activeTab === "test_viewpoints" && dbVpCount === 0) {
+      handleTabChange("requirements");
+    }
+  }, [activeTab, vpCount, tdFlowCount, dbVpCount]);
 
   const renderDynamicTable = (rows: any[], preferredOrder: string[] = []) => {
     if (!rows || rows.length === 0) return null;
@@ -487,20 +532,42 @@ export function ArtifactsPanel({
             </div>
           </div>
 
-          <TabsList className="grid w-full grid-cols-3 mb-0">
+          {(() => {
+            const numTabs = 2 + (vpCount > 0 ? 1 : 0) + (tdFlowCount > 0 ? 1 : 0) + (dbVpCount > 0 ? 1 : 0);
+            return (
+              <TabsList
+                className="grid w-full mb-0"
+                style={{ gridTemplateColumns: `repeat(${numTabs}, minmax(0, 1fr))` }}
+              >
             <TabsTrigger value="requirements" className="gap-2">
               <FileText className="h-4 w-4" />
               Requirements ({reqCount})
             </TabsTrigger>
-            <TabsTrigger value="viewpoints" className="gap-2">
-              <Target className="h-4 w-4" />
-              Viewpoints ({vpCount})
-            </TabsTrigger>
+            {vpCount > 0 && (
+              <TabsTrigger value="viewpoints" className="gap-2">
+                <Target className="h-4 w-4" />
+                Viewpoints ({vpCount})
+              </TabsTrigger>
+            )}
+            {tdFlowCount > 0 && (
+              <TabsTrigger value="test_design" className="gap-2">
+                <FileText className="h-4 w-4" />
+                Test Design ({tdFlowCount})
+              </TabsTrigger>
+            )}
+            {dbVpCount > 0 && (
+              <TabsTrigger value="test_viewpoints" className="gap-2">
+                <Target className="h-4 w-4" />
+                Test Viewpoints ({dbVpCount})
+              </TabsTrigger>
+            )}
             <TabsTrigger value="testcases" className="gap-2">
               <CheckSquare className="h-4 w-4" />
               Test Cases ({tcCount})
             </TabsTrigger>
-          </TabsList>
+              </TabsList>
+            );
+          })()}
         </div>
 
         {/* Tab Content */}
@@ -685,6 +752,38 @@ export function ArtifactsPanel({
             </CardContent>
           </Card>
         </TabsContent>
+
+        {tdFlowCount > 0 && (
+          <TabsContent value="test_design" className="flex-1 m-0 p-4 min-h-0">
+            <Card className="h-full flex flex-col min-h-0">
+              <CardContent className="p-0 flex-1 min-h-0">
+                <div className="flex-1 h-full overflow-hidden border border-border/50 rounded-md">
+                  <div className="h-full overflow-auto">
+                    {renderDynamicTable(tdFlowRows, ["id", "name", "requirements_linked", "description", "diagram_mermaid"]) || (
+                      <div className="p-6 text-center text-sm text-muted-foreground">No test design available.</div>
+                    )}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+        )}
+
+        {dbVpCount > 0 && (
+          <TabsContent value="test_viewpoints" className="flex-1 m-0 p-4 min-h-0">
+            <Card className="h-full flex flex-col min-h-0">
+              <CardContent className="p-0 flex-1 min-h-0">
+                <div className="flex-1 h-full overflow-hidden border border-border/50 rounded-md">
+                  <div className="h-full overflow-auto">
+                    {renderDynamicTable(dynamicTestViewpointRows, ["id", "test_design_id", "requirement_id", "name", "rationale", "content", "created_at"]) || (
+                      <div className="p-6 text-center text-sm text-muted-foreground">No test viewpoints available.</div>
+                    )}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+        )}
 
         <TabsContent value="viewpoints" className="flex-1 m-0 p-4 min-h-0">
           <Card className="h-full flex flex-col min-h-0">
