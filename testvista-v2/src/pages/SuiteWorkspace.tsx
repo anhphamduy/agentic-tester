@@ -452,6 +452,9 @@ export default function SuiteWorkspace() {
       if (source === 'testcase_writer' && name === 'generate_direct_testcases_on_docs') {
         return { role: 'ai', content: `I'm generating test cases directly from your documents...` };
       }
+      if (source === 'testcase_writer' && name === 'generate_integration_testcases_for_req') {
+        return { role: 'ai', content: `I'm generating integration test cases...` };
+      }
       if (source === 'requirements_extractor' && name === 'generate_test_design') {
         return { role: 'ai', content: `I'm preparing integration test design (sitemap + flows)...` };
       }
@@ -508,6 +511,19 @@ export default function SuiteWorkspace() {
       if (source === 'planner' && name === 'generate_preview') {
         const details = normalizeMarkdown(String(first?.content ?? ''));
         return { role: 'ai', content: details || 'Preview generated.' };
+      }
+      if (source === 'testcase_writer' && name === 'generate_integration_testcases_for_req') {
+        const raw = String(first?.content ?? '');
+        let generated = 0;
+        let failed = 0;
+        try {
+          let parsed: any;
+          try { parsed = JSON.parse(raw); } catch { parsed = JSON.parse(raw.replace(/'/g, '"')); }
+          generated = Number(parsed?.generated ?? 0) || 0;
+          failed = Number(parsed?.failed ?? 0) || 0;
+        } catch {}
+        const main = generated || failed ? `Integration test cases generated: ${generated} successful, ${failed} failed.` : 'Integration test cases generation finished.';
+        return { role: 'ai', content: main };
       }
       if (source === 'planner' && name === 'identify_gaps') {
         const detailsRaw = String(first?.content ?? '');
