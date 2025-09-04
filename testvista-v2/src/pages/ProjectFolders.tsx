@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -299,6 +299,63 @@ export default function ProjectFolders() {
   }>({});
   const project = mockProjects.find(p => p.id === projectId);
   const folders = getProjectFolders(projectId || "");
+
+  // Pagination state for Personal Projects (my-space)
+  const [personalSuites, setPersonalSuites] = useState<TestSuite[]>([]);
+  const [totalSuites, setTotalSuites] = useState<number>(0);
+  const [page, setPage] = useState<number>(1);
+  const pageSize = 10;
+  const [loadingSuites, setLoadingSuites] = useState<boolean>(false);
+  const totalPages = Math.max(1, Math.ceil(totalSuites / pageSize));
+
+  useEffect(() => {
+    // Reset page when navigating between projects
+    setPage(1);
+  }, [projectId]);
+
+  useEffect(() => {
+    const loadSuites = async () => {
+      if (projectId !== "my-space") return;
+      try {
+        setLoadingSuites(true);
+        const from = (page - 1) * pageSize;
+        const to = page * pageSize - 1;
+        const { data, error, count } = await supabase
+          .from("test_suites")
+          .select("id, name, description, status, updated_at, created_at", { count: "exact" })
+          .eq("project_id", projectId)
+          .order("updated_at", { ascending: false, nullsFirst: false })
+          .range(from, to);
+
+        if (error) throw error;
+
+        const mapped: TestSuite[] = (data || []).map((row: any) => ({
+          id: row.id,
+          name: row.name || "Untitled Suite",
+          description: row.description || "",
+          status: (row.status as "active" | "completed" | "draft") || "draft",
+          testCases: 0,
+          coverage: 0,
+          lastActivity: row.updated_at || row.created_at || "",
+          folderId: "1",
+        }));
+
+        setPersonalSuites(mapped);
+        setTotalSuites(count || 0);
+      } catch (err: any) {
+        toast({ title: "Failed to load suites", description: err.message, variant: "destructive" });
+      } finally {
+        setLoadingSuites(false);
+      }
+    };
+
+    loadSuites();
+  }, [projectId, page]);
+
+  // Merge fetched suites into Personal Projects folder when in my-space
+  const mergedFolders = projectId === "my-space"
+    ? folders.map(f => f.id === "1" ? { ...f, suites: personalSuites } : f)
+    : folders;
   const toggleFolder = (folderId: string) => {
     const newExpanded = new Set(expandedFolders);
     if (newExpanded.has(folderId)) {
@@ -364,7 +421,9 @@ export default function ProjectFolders() {
     }
   };
 
-  const filteredFolders = folders.filter(folder => folder.name.toLowerCase().includes(searchQuery.toLowerCase()) || folder.suites.some(suite => suite.name.toLowerCase().includes(searchQuery.toLowerCase())));
+  const filteredFolders = mergedFolders.filter(folder => folder.name.toLowerCase().includes(searchQuery.toLowerCase()) || folder.suites.some(suite => suite.name.toLowerCase().includes(searchQuery.toLowerCase())));
+  const startItem = totalSuites === 0 ? 0 : (page - 1) * pageSize + 1;
+  const endItem = Math.min(page * pageSize, totalSuites);
   if (!project) {
     return <div className="flex h-screen bg-workspace-bg">
         <Sidebar />
@@ -482,7 +541,7 @@ export default function ProjectFolders() {
                       <div className="flex items-center gap-6 text-sm text-muted-foreground">
                         <div className="flex items-center gap-1">
                           <CheckSquare className="h-4 w-4" />
-                          <span>{folder.suites.length} suites</span>
+                          <span>{projectId === 'my-space' && folder.id === '1' ? totalSuites : folder.suites.length} suites</span>
                         </div>
                         <div className="flex items-center gap-1">
                           <Calendar className="h-4 w-4" />
@@ -543,6 +602,9 @@ export default function ProjectFolders() {
 
                 {expandedFolders.has(folder.id) && <CardContent className="pt-0">
                     <div className="grid gap-3">
+                      {loadingSuites && projectId === 'my-space' && folder.id === '1' && (
+                        <div className="text-sm text-muted-foreground">Loading suites...</div>
+                      )}
                       {folder.suites.map(suite => <div key={suite.id} className="flex items-center justify-between p-4 rounded-lg border border-border/30 hover:bg-muted/30 cursor-pointer transition-colors" onClick={() => navigate(`/suite/${suite.id}`)}>
                           <div className="flex items-center gap-4">
                             <CheckSquare className="h-4 w-4 text-secondary" />
@@ -568,6 +630,32 @@ export default function ProjectFolders() {
                         <Plus className="h-4 w-4" />
                         Add New Suite to {folder.name}
                       </Button>
+
+                      {projectId === 'my-space' && folder.id === '1' && (
+                        <div className="mt-2 flex items-center justify-between">
+                          <div className="text-sm text-muted-foreground">
+                            {loadingSuites ? 'Loading…' : `Showing ${startItem}-${endItem} of ${totalSuites}`}
+                          </div>
+                          <div className="flex gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setPage(p => Math.max(1, p - 1))}
+                              disabled={page <= 1 || loadingSuites}
+                            >
+                              Previous
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                              disabled={page >= totalPages || loadingSuites}
+                            >
+                              Next
+                            </Button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </CardContent>}
               </Card>)}

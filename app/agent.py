@@ -344,6 +344,334 @@ Requirement text:
 
         return "Test cases generated successfully"
 
+    def generate_integration_testcases_for_req(
+        req_id: Optional[str] = None,
+        style: str = "json",
+        limit_cases_per_req: int = 4,
+    ) -> Dict[str, Any]:
+        """Generate Integration Testing cases per requirement using requirements, test design, and viewpoints.
+
+        - If req_id is None, generate for all requirements (concurrently), else only for that requirement.
+        - Leverages linked flows from the latest Integration Test Design and per-requirement Viewpoints.
+        - Persists results; embeds linkage metadata inside the JSON for downstream consumers.
+        """
+
+        # Load requirements list (from cache first, else DB)
+        reqs = _SUITE_REQUIREMENTS.get(suite_id_value) or []
+        if not reqs:
+            try:
+                data = (
+                    supabase_client.table("requirements")
+                    .select("id, req_code, content, source_doc")
+                    .eq("suite_id", suite_id_value)
+                    .execute()
+                    .data
+                    or []
+                )
+                reqs = []
+                for row in data:
+                    content = row.get("content") or {}
+                    if isinstance(content, dict):
+                        reqs.append(
+                            {
+                                "id": content.get("id") or row.get("req_code"),
+                                "text": content.get("text"),
+                                "source": content.get("source") or row.get("source_doc"),
+                            }
+                        )
+            except Exception:
+                reqs = []
+
+        # If generating suite-wide
+        if req_id is None:
+            targets = [
+                (r.get("id"), r.get("source", "unknown.txt"), r.get("text", ""))
+                for r in reqs
+                if isinstance(r, dict) and r.get("id")
+            ]
+            if not targets:
+                raise ValueError(
+                    "No requirements available. Extract requirements first."
+                )
+
+            def _worker(t: tuple[str, str, str]) -> Dict[str, Any]:
+                _rid, _src, _txt = t
+                return generate_integration_testcases_for_req(_rid, style, limit_cases_per_req)  # type: ignore[arg-type]
+
+            results: List[Dict[str, Any]] = []
+            errors: List[Dict[str, Any]] = []
+            max_workers = min(6, max(1, len(targets)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_worker, t): t for t in targets}
+                for f in as_completed(futures):
+                    _t = futures[f]
+                    try:
+                        results.append(f.result())
+                    except Exception as e:
+                        errors.append({"req_id": _t[0], "error": str(e)})
+            if results:
+                _update_suite_latest_version(1)
+            return {
+                "generated": len(results),
+                "failed": len(errors),
+                "results": results,
+                "errors": errors,
+            }
+
+        # For a single requirement, resolve its text/source
+        match = next(
+            (r for r in reqs if isinstance(r, dict) and r.get("id") == req_id), None
+        )
+        if not match:
+            raise ValueError(f"Requirement {req_id} not found.")
+        source = match.get("source", "unknown.txt")
+        text = match.get("text", "")
+
+        # Resolve requirement DB row id (for linking viewpoints)
+        requirement_row_id: Optional[str] = None
+        try:
+            rr = (
+                supabase_client.table("requirements")
+                .select("id")
+                .eq("suite_id", suite_id_value)
+                .eq("req_code", str(req_id))
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if rr:
+                requirement_row_id = str((rr[0] or {}).get("id"))
+        except Exception:
+            requirement_row_id = None
+
+        # Load latest Integration Test Design for the suite
+        test_design_content: Dict[str, Any] = {}
+        test_design_id_value: Optional[str] = _SUITE_TEST_DESIGN_ID.get(suite_id_value)
+        try:
+            if test_design_id_value:
+                td_rows = (
+                    supabase_client.table("test_designs")
+                    .select("id, content")
+                    .eq("id", test_design_id_value)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+            else:
+                td_rows = (
+                    supabase_client.table("test_designs")
+                    .select("id, content")
+                    .eq("suite_id", suite_id_value)
+                    .eq("testing_type", "integration")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+            if td_rows:
+                test_design_id_value = str((td_rows[0] or {}).get("id") or test_design_id_value)
+                cd = (td_rows[0] or {}).get("content")
+                if isinstance(cd, dict):
+                    test_design_content = cd
+        except Exception:
+            pass
+
+        # Determine flows linked to this requirement
+        linked_flows: List[Dict[str, Any]] = []
+        try:
+            all_flows = test_design_content.get("flows") if isinstance(test_design_content, dict) else None
+            if isinstance(all_flows, list):
+                for f in all_flows:
+                    if not isinstance(f, dict):
+                        continue
+                    req_links = f.get("requirements_linked")
+                    if isinstance(req_links, list) and any(str(x) == str(req_id) for x in req_links):
+                        linked_flows.append(f)
+        except Exception:
+            linked_flows = []
+        linked_flow_ids = [str(f.get("id")) for f in linked_flows if f.get("id")]
+
+        # Load viewpoints for this requirement
+        linked_viewpoints: List[Dict[str, Any]] = []
+        try:
+            if requirement_row_id:
+                vp_rows = (
+                    supabase_client.table("viewpoints")
+                    .select("id, requirement_id, name, rationale, content, test_design_id")
+                    .eq("suite_id", suite_id_value)
+                    .eq("requirement_id", requirement_row_id)
+                    .execute()
+                    .data
+                    or []
+                )
+            else:
+                vp_rows = []
+            for r in vp_rows:
+                if isinstance(r, dict):
+                    linked_viewpoints.append(
+                        {
+                            "id": r.get("id"),
+                            "name": r.get("name"),
+                            "rationale": r.get("rationale"),
+                        }
+                    )
+        except Exception:
+            linked_viewpoints = []
+        linked_viewpoint_ids = [str(v.get("id")) for v in linked_viewpoints if v.get("id")]
+        linked_viewpoint_names = [str(v.get("name")) for v in linked_viewpoints if v.get("name")]
+
+        # Trim contexts for prompt
+        try:
+            flows_ctx = json.dumps(linked_flows[:6], ensure_ascii=False)
+        except Exception:
+            flows_ctx = "[]"
+        try:
+            vps_ctx = json.dumps(linked_viewpoints[:8], ensure_ascii=False)
+        except Exception:
+            vps_ctx = "[]"
+
+        # Compose prompt for Integration test case generation
+        prompt = f"""
+You are an expert Integration Testing engineer. Create concise, high-value INTEGRATION test cases for the requirement below.
+
+Use ALL provided context (requirement text, linked flows from the Integration Test Design, and per-requirement viewpoints). Where appropriate, align cases to flows and viewpoints.
+
+Return ONLY a JSON object with EXACTLY the following fields and types (no markdown):
+{{
+  "requirement_id": "{req_id}",
+  "source": "{source}",
+  "testing_type": "integration",
+  "test_design_id": "{test_design_id_value or ''}",
+  "linked_flows": ["<Flow-ID>"],
+  "linked_viewpoints": ["<Viewpoint-Name>"],
+  "cases": [
+    {{"id": "<short id>", "type": "happy|edge|negative|alt", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": "...", "links": {{"flows": ["<Flow-ID>"], "viewpoints": ["<Viewpoint-Name>"]}}}}
+  ]
+}}
+
+Guidelines:
+- Provide {limit_cases_per_req} focused cases, each exercising inter-component behavior, interfaces/APIs, data flow, and error handling.
+- Prefer referencing flows by id and viewpoints by name when relevant.
+- Keep steps very short; ensure each case is independently executable.
+- Do NOT invent additional requirements; stick to the given text and artifacts.
+
+Requirement Text:
+{text}
+
+Linked Flows (subset):
+{flows_ctx}
+
+Viewpoints (subset):
+{vps_ctx}
+""".strip()
+
+        resp = _oai.chat.completions.create(
+            model=global_settings.openai_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Return strict JSON only; no extra text. Generate compact integration test cases with clear steps and explicit linkage to flows and viewpoints.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            reasoning_effort="minimal",
+        )
+        raw = resp.choices[0].message.content or "{}"
+
+        try:
+            tc_obj = json.loads(raw)
+            assert isinstance(tc_obj, dict)
+            # Normalize core fields
+            if "requirement_id" not in tc_obj:
+                tc_obj["requirement_id"] = str(req_id)
+            if "source" not in tc_obj:
+                tc_obj["source"] = str(source)
+            tc_obj["testing_type"] = "integration"
+            if test_design_id_value and not tc_obj.get("test_design_id"):
+                tc_obj["test_design_id"] = str(test_design_id_value)
+            # Ensure linkage arrays
+            for link_key, default_vals in (
+                ("linked_flows", linked_flow_ids),
+                ("linked_viewpoints", linked_viewpoint_names),
+            ):
+                vals = tc_obj.get(link_key)
+                if not isinstance(vals, list):
+                    tc_obj[link_key] = list(default_vals)
+                else:
+                    tc_obj[link_key] = [str(v) for v in vals]
+
+            # Normalize cases similar to the other generator
+            try:
+                cases = tc_obj.get("cases")
+                if isinstance(cases, list):
+                    normalized_cases: List[Dict[str, Any]] = []
+                    for c in cases:
+                        if not isinstance(c, dict):
+                            normalized_cases.append(
+                                {
+                                    "id": "",
+                                    "type": "info",
+                                    "title": str(c),
+                                    "preconditions": "",
+                                    "steps": str(c),
+                                    "expected": "",
+                                }
+                            )
+                            continue
+                        normalized_case = dict(c)
+                        for key in ("preconditions", "steps"):
+                            val = normalized_case.get(key)
+                            if isinstance(val, list):
+                                normalized_case[key] = "; ".join(str(x) for x in val)
+                            elif val is None:
+                                normalized_case[key] = ""
+                            else:
+                                normalized_case[key] = str(val)
+                        for key in ("id", "title", "type", "expected"):
+                            val = normalized_case.get(key)
+                            if val is None:
+                                normalized_case[key] = ""
+                            elif not isinstance(val, str):
+                                normalized_case[key] = str(val)
+                        normalized_cases.append(normalized_case)
+                    # Ensure unique ids
+                    used_ids = set()
+                    for idx, case in enumerate(normalized_cases, start=1):
+                        raw_id = case.get("id")
+                        new_id = raw_id.strip() if isinstance(raw_id, str) else ""
+                        if not new_id:
+                            new_id = f"{req_id}-ITC-{idx}"
+                        uniq_id = new_id
+                        counter = 2
+                        while uniq_id in used_ids:
+                            uniq_id = f"{new_id}-{counter}"
+                            counter += 1
+                        case["id"] = uniq_id
+                        used_ids.add(uniq_id)
+                    tc_obj["cases"] = normalized_cases
+            except Exception:
+                pass
+        except Exception as e:
+            raise ValueError(f"Invalid JSON from integration testcase writer: {e}")
+
+        # Persist testcases (best-effort). Upsert per requirement like the base generator.
+        try:
+            _results_writer.write_testcases(
+                session_id=suite_id_value,
+                req_code=str(req_id),
+                testcases=tc_obj,
+                suite_id=suite_id_value,
+            )
+        except Exception:
+            pass
+
+        _update_suite_latest_version(1)
+
+        return "Integration test cases generated successfully"
+
     def edit_testcases_for_req(user_edit_request: str) -> Dict[str, Any]:
         """Edit existing test cases suite-wide based on a freeform user edit request.
 
@@ -1436,12 +1764,14 @@ Documents:
             generate_and_store_testcases_for_req,
             generate_direct_testcases_on_docs,
             edit_testcases_for_req,
+            generate_integration_testcases_for_req,
         ],
         system_message=(
             "You MUST call a tool to act. Never reply with free text.\n"
             "- To generate directly from docs: call generate_direct_testcases_on_docs() and then handoff back to planner.\n"
             "- To generate from extracted requirements: if no specific requirement id is provided, call generate_and_store_testcases_for_req() (all requirements, concurrently).\n"
             "- If a specific requirement id is provided, call generate_and_store_testcases_for_req(req_id).\n"
+            "- To generate Integration test cases leveraging Test Design and Viewpoints, call generate_integration_testcases_for_req(req_id?) and then handoff back to planner.\n"
             "- To edit existing cases suite-wide, call edit_testcases_for_req(user_edit_request).\n"
             "After any tool call, immediately handoff back to planner.\n"
             "If the user asks about test cases or requirements information, do not answer; handoff to planner so it can respond using its info tools."
