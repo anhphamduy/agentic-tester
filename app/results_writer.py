@@ -11,6 +11,8 @@ class ResultsWriter:
         session_id: str,
         requirements: List[Dict[str, Any]],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> None:
         raise NotImplementedError
 
@@ -21,6 +23,8 @@ class ResultsWriter:
         req_code: str,
         testcases: Dict[str, Any],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> None:
         raise NotImplementedError
 
@@ -62,6 +66,8 @@ class ResultsWriter:
         suite_id: Optional[str],
         content: Dict[str, Any],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> Optional[str]:
         raise NotImplementedError
 
@@ -74,6 +80,8 @@ class ResultsWriter:
         content: Dict[str, Any],
         test_design_id: Optional[str],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> List[str]:
         raise NotImplementedError
 
@@ -85,6 +93,8 @@ class NoopResultsWriter(ResultsWriter):
         session_id: str,
         requirements: List[Dict[str, Any]],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> None:
         return None
 
@@ -95,6 +105,8 @@ class NoopResultsWriter(ResultsWriter):
         req_code: str,
         testcases: Dict[str, Any],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> None:
         return None
 
@@ -129,6 +141,8 @@ class NoopResultsWriter(ResultsWriter):
         suite_id: Optional[str],
         content: Dict[str, Any],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> Optional[str]:
         return None
 
@@ -140,6 +154,8 @@ class NoopResultsWriter(ResultsWriter):
         content: Dict[str, Any],
         test_design_id: Optional[str],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> List[str]:
         return []
 
@@ -181,6 +197,8 @@ class SupabaseResultsWriter(ResultsWriter):
         session_id: str,
         requirements: List[Dict[str, Any]],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> None:
         rows: List[Dict[str, Any]] = []
         for r in requirements:
@@ -194,20 +212,23 @@ class SupabaseResultsWriter(ResultsWriter):
                     "req_code": req_code,
                     "source_doc": source_doc,
                     "content": r,
+                    "version": version,
+                    "active": bool(active),
                 }
             )
 
-        # Upsert manually: update if exists, else insert
+        # Store as new versioned rows: deactivate prior active then insert
         for row in rows:
-            existing_id = self._get_requirement_row_id(
-                suite_id=row["suite_id"], req_code=row["req_code"]
-            )
-            if existing_id:
-                self._client.table("requirements").update(
-                    {"source_doc": row["source_doc"], "content": row["content"]}
-                ).eq("id", existing_id).execute()
-            else:
-                self._client.table("requirements").insert(row).execute()
+            # Deactivate previous active row(s) for this key
+            try:
+                q = self._client.table("requirements").update(
+                    {"active": False}
+                ).eq("suite_id", row["suite_id"]).eq("req_code", row["req_code"]).eq("active", True)
+                q.execute()
+            except Exception:
+                pass
+            # Insert new active row with version
+            self._client.table("requirements").insert(row).execute()
 
     def write_testcases(
         self,
@@ -216,6 +237,8 @@ class SupabaseResultsWriter(ResultsWriter):
         req_code: str,
         testcases: Dict[str, Any],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> None:
         # Find requirement row by (suite_id, req_code)
         req_row_id = self._get_requirement_row_id(suite_id=suite_id, req_code=req_code)
@@ -230,7 +253,11 @@ class SupabaseResultsWriter(ResultsWriter):
                         "id": req_code,
                         "source": testcases.get("source", ""),
                         "text": testcases.get("requirement_text", ""),
+                        "version": version,
+                        "active": bool(active),
                     },
+                    "version": version,
+                    "active": bool(active),
                 }
             ).execute()
             req_row_id = self._get_requirement_row_id(
@@ -239,28 +266,21 @@ class SupabaseResultsWriter(ResultsWriter):
             if not req_row_id:
                 return
 
-        # Upsert test_cases by unique(requirement_id)
-        existing = (
-            self._client.table("test_cases")
-            .select("id, requirement_id, suite_id")
-            .eq("requirement_id", req_row_id)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-        if existing:
-            self._client.table("test_cases").update(
-                {"content": testcases, "suite_id": suite_id}
-            ).eq("id", existing[0]["id"]).execute()
-        else:
-            self._client.table("test_cases").insert(
-                {
-                    "requirement_id": req_row_id,
-                    "suite_id": suite_id,
-                    "content": testcases,
-                }
-            ).execute()
+        # Deactivate existing active test_cases for this requirement_id
+        try:
+            self._client.table("test_cases").update({"active": False}).eq("requirement_id", req_row_id).eq("active", True).execute()
+        except Exception:
+            pass
+        # Insert new versioned active row
+        self._client.table("test_cases").insert(
+            {
+                "requirement_id": req_row_id,
+                "suite_id": suite_id,
+                "content": testcases,
+                "version": version,
+                "active": bool(active),
+            }
+        ).execute()
 
     def write_event(
         self,
@@ -331,11 +351,20 @@ class SupabaseResultsWriter(ResultsWriter):
         suite_id: Optional[str],
         content: Dict[str, Any],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> Optional[str]:
+        # Deactivate prior active for (suite_id, testing_type)
+        try:
+            self._client.table("test_designs").update({"active": False}).eq("suite_id", suite_id).eq("testing_type", testing_type).eq("active", True).execute()
+        except Exception:
+            pass
         row = {
             "suite_id": suite_id,
             "testing_type": testing_type,
             "content": content,
+            "version": version,
+            "active": bool(active),
         }
         res = self._client.table("test_designs").insert(row).execute()
         try:
@@ -351,6 +380,8 @@ class SupabaseResultsWriter(ResultsWriter):
         content: Dict[str, Any],
         test_design_id: Optional[str],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
     ) -> List[str]:
         inserted_ids: List[str] = []
         vp_groups = content.get("viewpoints") if isinstance(content, dict) else None
@@ -369,6 +400,11 @@ class SupabaseResultsWriter(ResultsWriter):
             for it in items:
                 if not isinstance(it, dict):
                     continue
+                # Deactivate prior active with same natural key (suite, requirement, name)
+                try:
+                    self._client.table("viewpoints").update({"active": False}).eq("suite_id", suite_id).eq("requirement_id", requirement_id).eq("name", it.get("name")).eq("active", True).execute()
+                except Exception:
+                    pass
                 row = {
                     "suite_id": suite_id,
                     "test_design_id": test_design_id,
@@ -376,6 +412,8 @@ class SupabaseResultsWriter(ResultsWriter):
                     "name": it.get("name"),
                     "rationale": it.get("rationale"),
                     "content": it,
+                    "version": version,
+                    "active": bool(active),
                 }
                 res = self._client.table("viewpoints").insert(row).execute()
                 try:

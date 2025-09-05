@@ -10,6 +10,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional
 from uuid import uuid4
+from datetime import datetime, timezone
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.conditions import TextMentionTermination, HandoffTermination
@@ -111,6 +112,68 @@ def make_team_for_suite(
         except Exception:
             pass
 
+    def _increment_suite_version(description: Optional[str] = None) -> Optional[int]:
+        """Atomically increment suite-level latest_testcases_version by 1.
+
+        - Reads prior agent_state via results_writer.get_suite_state (best-effort)
+        - Computes new_version = (prior or 0) + 1
+        - Writes merged state with updated latest_testcases_version
+        - Appends a short entry to version_history with timestamp and description
+        - Returns the new version if successful, else None
+        """
+        try:
+            prior_state = _get_suite_agent_state(suite_id_value) or {}
+            prior_val = prior_state.get("latest_testcases_version")
+            try:
+                prior_int = int(prior_val) if prior_val is not None else 0
+            except Exception:
+                prior_int = 0
+            new_version = prior_int + 1
+            merged_state = dict(prior_state)
+            merged_state["latest_testcases_version"] = int(new_version)
+            # Build/append version history separately
+            hist: List[Dict[str, Any]] = []
+            try:
+                if isinstance(prior_state.get("version_history"), list):
+                    hist = list(prior_state.get("version_history"))  # type: ignore[list-item]
+                elif isinstance(prior_state.get("agent_state"), dict) and isinstance(
+                    prior_state.get("agent_state", {}).get("version_history"), list
+                ):
+                    hist = list(prior_state.get("agent_state", {}).get("version_history"))  # type: ignore[list-item]
+            except Exception:
+                hist = []
+            hist.append(
+                {
+                    "version": int(new_version),
+                    "description": str(description or ""),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            _write_full_suite_state(
+                suite_id=suite_id_value,
+                agent_state=merged_state,
+                latest_version=int(new_version),
+                version_history=hist,
+            )
+            # Emit a new_version event
+            try:
+                _results_writer.write_event(
+                    suite_id=suite_id_value,
+                    event={
+                        "type": "new_version",
+                        "suite_id": suite_id_value,
+                        "version": int(new_version),
+                        "description": str(description or ""),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                    message_id=message_id,
+                )
+            except Exception:
+                pass
+            return int(new_version)
+        except Exception:
+            return None
+
     def extract_and_store_requirements() -> Dict[str, Any]:
         sdir = SESSIONS_ROOT / suite_id_value
         docs_dir = sdir / "docs"
@@ -159,10 +222,15 @@ Documents:
         # Cache per suite
         _SUITE_REQUIREMENTS[suite_id_value] = reqs
 
-        # Persist requirements (best-effort)
+        # Increment suite version and persist requirements (best-effort)
+        version_now = _increment_suite_version("Requirements extracted")
         try:
             _results_writer.write_requirements(
-                session_id=suite_id_value, requirements=reqs, suite_id=suite_id_value
+                session_id=suite_id_value,
+                requirements=reqs,
+                suite_id=suite_id_value,
+                version=version_now,
+                active=True,
             )
         except Exception:
             pass
@@ -193,9 +261,130 @@ Documents:
                     "No requirements available. Extract requirements first."
                 )
 
+            # Increment suite version once for this bulk generation and reuse for all inserts
+            version_now = _increment_suite_version(
+                "Generated test cases for all requirements"
+            )
+
             def _worker(t: tuple[str, str, str]) -> Dict[str, Any]:
                 _rid, _src, _txt = t
-                return generate_and_store_testcases_for_req(_rid, style)
+                # Build prompt per requirement and persist with shared version
+                prompt_local = f"""
+You are a precise QA engineer. Write three concise, testable cases (happy, edge, negative) for the requirement below.
+
+Return ONLY a JSON object (no markdown, no commentary). Use EXACTLY these fields and types:
+{{
+  "requirement_id": "{_rid}",
+  "source": "{_src}",
+  "requirement_text": "<brief restatement of the requirement>",
+  "cases": [
+    {{"id": "<short id>", "type": "happy", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
+    {{"id": "<short id>", "type": "edge", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
+    {{"id": "<short id>", "type": "negative", "title": "<short title>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}}
+  ]
+}}
+
+Requirement text:
+{_txt}
+""".strip()
+                resp_local = _oai.chat.completions.create(
+                    model=global_settings.openai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Return exact JSON only; no extra text. Generate compact, testable QA cases with clear steps and expectations.",
+                        },
+                        {"role": "user", "content": prompt_local},
+                    ],
+                    reasoning_effort="minimal",
+                )
+                raw_local = resp_local.choices[0].message.content or "{}"
+                try:
+                    tc_obj_local = json.loads(raw_local)
+                    assert isinstance(tc_obj_local, dict)
+                    # Normalize like the single path
+                    try:
+                        cases_local = tc_obj_local.get("cases")
+                        if isinstance(cases_local, list):
+                            normalized_cases_local = []
+                            for c in cases_local:
+                                if not isinstance(c, dict):
+                                    normalized_cases_local.append(
+                                        {
+                                            "id": "",
+                                            "type": "info",
+                                            "title": str(c),
+                                            "preconditions": "",
+                                            "steps": str(c),
+                                            "expected": "",
+                                        }
+                                    )
+                                    continue
+                                normalized_case_local = dict(c)
+                                for key in ("preconditions", "steps"):
+                                    val = normalized_case_local.get(key)
+                                    if isinstance(val, list):
+                                        normalized_case_local[key] = "; ".join(
+                                            str(x) for x in val
+                                        )
+                                    elif val is None:
+                                        normalized_case_local[key] = ""
+                                    else:
+                                        normalized_case_local[key] = str(val)
+                                for key in ("id", "title", "type", "expected"):
+                                    val = normalized_case_local.get(key)
+                                    if val is None:
+                                        normalized_case_local[key] = ""
+                                    elif not isinstance(val, str):
+                                        normalized_case_local[key] = str(val)
+                                normalized_cases_local.append(normalized_case_local)
+                            # Ensure unique ids
+                            used_ids_local = set()
+                            for idx_local, case_local in enumerate(
+                                normalized_cases_local, start=1
+                            ):
+                                raw_id_local = case_local.get("id")
+                                new_id_local = (
+                                    raw_id_local.strip()
+                                    if isinstance(raw_id_local, str)
+                                    else ""
+                                )
+                                if not new_id_local:
+                                    new_id_local = f"{_rid}-TC-{idx_local}"
+                                uniq_id_local = new_id_local
+                                counter_local = 2
+                                while uniq_id_local in used_ids_local:
+                                    uniq_id_local = f"{new_id_local}-{counter_local}"
+                                    counter_local += 1
+                                case_local["id"] = uniq_id_local
+                                used_ids_local.add(uniq_id_local)
+                            tc_obj_local["cases"] = normalized_cases_local
+                        for key in ("requirement_id", "source", "requirement_text"):
+                            if key in tc_obj_local and not isinstance(
+                                tc_obj_local[key], str
+                            ):
+                                tc_obj_local[key] = str(tc_obj_local[key])
+                        # Ensure id/source if missing
+                        tc_obj_local.setdefault("requirement_id", str(_rid))
+                        tc_obj_local.setdefault("source", str(_src))
+                    except Exception:
+                        pass
+                except Exception as e_local:
+                    raise ValueError(f"Invalid JSON from testcase writer: {e_local}")
+
+                # Persist with shared version
+                try:
+                    _results_writer.write_testcases(
+                        session_id=suite_id_value,
+                        req_code=str(_rid),
+                        testcases=tc_obj_local,
+                        suite_id=suite_id_value,
+                        version=version_now,
+                        active=True,
+                    )
+                except Exception:
+                    pass
+                return {"req_id": _rid, "status": "ok"}
 
             results: List[Dict[str, Any]] = []
             errors: List[Dict[str, Any]] = []
@@ -208,9 +397,6 @@ Documents:
                         results.append(f.result())
                     except Exception as e:
                         errors.append({"req_id": _t[0], "error": str(e)})
-            # First generation implies suite-level version 1 if any were generated
-            if results:
-                _update_suite_latest_version(1)
             return {
                 "generated": len(results),
                 "failed": len(errors),
@@ -328,19 +514,19 @@ Requirement text:
         except Exception as e:
             raise ValueError(f"Invalid JSON from testcase writer: {e}")
 
-        # Persist testcases (best-effort)
+        # Persist testcases (best-effort) with the suite stage version
         try:
+            version_now = _increment_suite_version("Generated test cases")
             _results_writer.write_testcases(
                 session_id=suite_id_value,
                 req_code=req_id,
                 testcases=tc_obj,
                 suite_id=suite_id_value,
+                version=version_now,
+                active=True,
             )
         except Exception:
             pass
-
-        # Ensure suite state reflects at least version 1 after initial generation
-        _update_suite_latest_version(1)
 
         return "Test cases generated successfully"
 
@@ -376,7 +562,8 @@ Requirement text:
                             {
                                 "id": content.get("id") or row.get("req_code"),
                                 "text": content.get("text"),
-                                "source": content.get("source") or row.get("source_doc"),
+                                "source": content.get("source")
+                                or row.get("source_doc"),
                             }
                         )
             except Exception:
@@ -394,9 +581,64 @@ Requirement text:
                     "No requirements available. Extract requirements first."
                 )
 
+            version_now = _increment_suite_version(
+                "Generated integration test cases for all requirements"
+            )
+
             def _worker(t: tuple[str, str, str]) -> Dict[str, Any]:
                 _rid, _src, _txt = t
-                return generate_integration_testcases_for_req(_rid, style, limit_cases_per_req)  # type: ignore[arg-type]
+                # Reuse the same prompt structure as single path
+                prompt_local = f"""
+You are an expert Integration Testing engineer. Create concise, high-value INTEGRATION test cases for the requirement below.
+
+Return ONLY a JSON object with EXACTLY the following fields and types (no markdown):
+{{
+  "requirement_id": "{_rid}",
+  "source": "{_src}",
+  "testing_type": "integration",
+  "test_design_id": "{_SUITE_TEST_DESIGN_ID.get(suite_id_value) or ''}",
+  "linked_flows": ["<Flow-ID>"],
+  "linked_viewpoints": ["<Viewpoint-Name>"],
+  "cases": [
+    {{"id": "<short id>", "type": "happy|edge|negative|alt", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": "...", "links": {{"flows": ["<Flow-ID>"], "viewpoints": ["<Viewpoint-Name>"]}}}}
+  ]
+}}
+
+Requirement Text:
+{_txt}
+""".strip()
+                resp_local = _oai.chat.completions.create(
+                    model=global_settings.openai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Return strict JSON only; no extra text. Generate compact integration test cases with clear steps and explicit linkage to flows and viewpoints.",
+                        },
+                        {"role": "user", "content": prompt_local},
+                    ],
+                    reasoning_effort="minimal",
+                )
+                raw_local = resp_local.choices[0].message.content or "{}"
+                try:
+                    tc_obj_local = json.loads(raw_local)
+                    assert isinstance(tc_obj_local, dict)
+                except Exception as e_local:
+                    raise ValueError(
+                        f"Invalid JSON from integration testcase writer: {e_local}"
+                    )
+                # Persist with shared version
+                try:
+                    _results_writer.write_testcases(
+                        session_id=suite_id_value,
+                        req_code=str(_rid),
+                        testcases=tc_obj_local,
+                        suite_id=suite_id_value,
+                        version=version_now,
+                        active=True,
+                    )
+                except Exception:
+                    pass
+                return {"req_id": _rid, "status": "ok"}
 
             results: List[Dict[str, Any]] = []
             errors: List[Dict[str, Any]] = []
@@ -409,8 +651,6 @@ Requirement text:
                         results.append(f.result())
                     except Exception as e:
                         errors.append({"req_id": _t[0], "error": str(e)})
-            if results:
-                _update_suite_latest_version(1)
             return {
                 "generated": len(results),
                 "failed": len(errors),
@@ -472,7 +712,9 @@ Requirement text:
                     or []
                 )
             if td_rows:
-                test_design_id_value = str((td_rows[0] or {}).get("id") or test_design_id_value)
+                test_design_id_value = str(
+                    (td_rows[0] or {}).get("id") or test_design_id_value
+                )
                 cd = (td_rows[0] or {}).get("content")
                 if isinstance(cd, dict):
                     test_design_content = cd
@@ -482,13 +724,19 @@ Requirement text:
         # Determine flows linked to this requirement
         linked_flows: List[Dict[str, Any]] = []
         try:
-            all_flows = test_design_content.get("flows") if isinstance(test_design_content, dict) else None
+            all_flows = (
+                test_design_content.get("flows")
+                if isinstance(test_design_content, dict)
+                else None
+            )
             if isinstance(all_flows, list):
                 for f in all_flows:
                     if not isinstance(f, dict):
                         continue
                     req_links = f.get("requirements_linked")
-                    if isinstance(req_links, list) and any(str(x) == str(req_id) for x in req_links):
+                    if isinstance(req_links, list) and any(
+                        str(x) == str(req_id) for x in req_links
+                    ):
                         linked_flows.append(f)
         except Exception:
             linked_flows = []
@@ -500,7 +748,9 @@ Requirement text:
             if requirement_row_id:
                 vp_rows = (
                     supabase_client.table("viewpoints")
-                    .select("id, requirement_id, name, rationale, content, test_design_id")
+                    .select(
+                        "id, requirement_id, name, rationale, content, test_design_id"
+                    )
                     .eq("suite_id", suite_id_value)
                     .eq("requirement_id", requirement_row_id)
                     .execute()
@@ -520,8 +770,12 @@ Requirement text:
                     )
         except Exception:
             linked_viewpoints = []
-        linked_viewpoint_ids = [str(v.get("id")) for v in linked_viewpoints if v.get("id")]
-        linked_viewpoint_names = [str(v.get("name")) for v in linked_viewpoints if v.get("name")]
+        linked_viewpoint_ids = [
+            str(v.get("id")) for v in linked_viewpoints if v.get("id")
+        ]
+        linked_viewpoint_names = [
+            str(v.get("name")) for v in linked_viewpoints if v.get("name")
+        ]
 
         # Trim contexts for prompt
         try:
@@ -657,18 +911,19 @@ Viewpoints (subset):
         except Exception as e:
             raise ValueError(f"Invalid JSON from integration testcase writer: {e}")
 
-        # Persist testcases (best-effort). Upsert per requirement like the base generator.
+        # Persist testcases (best-effort) with suite stage version
         try:
+            version_now = _increment_suite_version("Generated integration test cases")
             _results_writer.write_testcases(
                 session_id=suite_id_value,
                 req_code=str(req_id),
                 testcases=tc_obj,
                 suite_id=suite_id_value,
+                version=version_now,
+                active=True,
             )
         except Exception:
             pass
-
-        _update_suite_latest_version(1)
 
         return "Integration test cases generated successfully"
 
@@ -845,12 +1100,14 @@ Viewpoints (subset):
             '      "new_testcases": <FULL JSON for the updated test cases for this requirement>\n'
             "    }\n"
             "  ],\n"
-            '  "summary": "<1-2 sentences>"\n'
+            '  "summary": "<1-2 sentences>",\n'
+            '  "version_note": "<3-10 words describing this bulk edit>"\n'
             "}\n\n"
             "Guidance:\n"
             "- Choose impacted requirements using req_code and/or requirement_id.\n"
             "- Keep steps/preconditions formatting consistent; do not drop unknown fields.\n"
-            '- If nothing applies, return "edits": [].\n\n'
+            '- Provide version_note as a concise history entry (e.g., "Refined negative paths").\n'
+            '- If nothing applies, return "edits": [] and set version_note to an empty string.\n\n'
             f"Requirements Context:\n{req_ctx}\n\n"
             f"Current Test Cases Context (latest per requirement):\n{tc_ctx}\n\n"
             f"User Edit Request:\n{user_edit_request}\n"
@@ -876,12 +1133,21 @@ Viewpoints (subset):
 
         edits = llm_out.get("edits") or []
         summary = llm_out.get("summary") or ""
+        version_note = llm_out.get("version_note") or ""
+        if not isinstance(version_note, str):
+            try:
+                version_note = str(version_note)
+            except Exception:
+                version_note = ""
         if not isinstance(edits, list):
             edits = []
 
         results: List[Dict[str, Any]] = []
         event_edits: List[Dict[str, Any]] = []
-        max_new_version_for_suite: Optional[int] = None
+        # Increment suite version once for this bulk edit operation with LLM-provided note
+        edit_suite_version = _increment_suite_version(
+            version_note or "Edited test cases (bulk)"
+        )
 
         # 4) Apply edits per requirement
         for e in edits:
@@ -915,73 +1181,34 @@ Viewpoints (subset):
                 )
             except Exception:
                 old_version = None
-            new_version = (old_version or 1) + 1 if latest_row else 1
 
-            # Ensure version embedded
-            if isinstance(new_testcases, dict) and "version" not in new_testcases:
-                try:
-                    ntc = dict(new_testcases)
-                    ntc["version"] = new_version
-                    new_testcases = ntc
-                except Exception:
-                    pass
+            # Ensure version embedded equals the suite edit version
+            try:
+                if isinstance(new_testcases, dict):
+                    new_testcases = {**new_testcases, "version": edit_suite_version}
+            except Exception:
+                pass
 
             inserted_row_id: Optional[str] = None
-            # Try versioned insert
+            # Persist via results writer to enforce version/active behavior
             try:
-                res = (
-                    supabase_client.table("test_cases")
-                    .insert(
-                        {
-                            "requirement_id": resolved_req_id,
-                            "suite_id": suite_id_value,
-                            "content": new_testcases,
-                            "version": new_version,
-                        }
-                    )
-                    .execute()
+                _results_writer.write_testcases(
+                    session_id=suite_id_value,
+                    req_code=str(req_row.get("req_code")),
+                    testcases=new_testcases,
+                    suite_id=suite_id_value,
+                    version=edit_suite_version,
+                    active=True,
                 )
-                try:
-                    inserted_row_id = ((res.data or [])[0] or {}).get("id")
-                except Exception:
-                    inserted_row_id = None
-            except Exception as e:
-                print(f"Error inserting test case: {e}")
-                # Fallback to update/insert without version
-                try:
-                    if latest_row and latest_row.get("id"):
-                        supabase_client.table("test_cases").update(
-                            {
-                                "content": new_testcases,
-                                "suite_id": suite_id_value,
-                            }
-                        ).eq("id", latest_row.get("id")).execute()
-                        inserted_row_id = latest_row.get("id")
-                    else:
-                        res2 = (
-                            supabase_client.table("test_cases")
-                            .insert(
-                                {
-                                    "requirement_id": resolved_req_id,
-                                    "suite_id": suite_id_value,
-                                    "content": new_testcases,
-                                }
-                            )
-                            .execute()
-                        )
-                        try:
-                            inserted_row_id = ((res2.data or [])[0] or {}).get("id")
-                        except Exception:
-                            inserted_row_id = None
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
             results.append(
                 {
                     "requirement_id": resolved_req_id,
                     "req_code": req_row.get("req_code"),
                     "old_version": old_version or (1 if latest_row else 0),
-                    "new_version": new_version,
+                    "new_version": edit_suite_version,
                     "row_id": inserted_row_id,
                 }
             )
@@ -992,20 +1219,10 @@ Viewpoints (subset):
                     "diff": diff,
                     "new_testcases": new_testcases,
                     "old_version": old_version or (1 if latest_row else 0),
-                    "new_version": new_version,
+                    "new_version": edit_suite_version,
                     "row_id": inserted_row_id,
                 }
             )
-
-            # Track the highest new version across edits for suite-level state
-            try:
-                if (
-                    max_new_version_for_suite is None
-                    or int(new_version) > max_new_version_for_suite
-                ):
-                    max_new_version_for_suite = int(new_version)
-            except Exception:
-                pass
 
         # 5) Record one bulk event (best-effort)
         _results_writer.write_event(
@@ -1015,14 +1232,13 @@ Viewpoints (subset):
                 "suite_id": suite_id_value,
                 "edits": event_edits,
                 "summary": summary,
+                "version_note": version_note,
                 "user_edit_request": user_edit_request,
             },
             message_id=message_id,
         )
 
-        # Update suite latest_version if any edits produced a new version
-        if max_new_version_for_suite is not None:
-            _update_suite_latest_version(max_new_version_for_suite)
+        # Suite version already incremented at start of edits
 
         return {
             "edited_count": len(results),
@@ -1334,18 +1550,18 @@ Documents:
             "3. Output Format (Mandatory)\n"
             "   - Return STRICT JSON ONLY with the following shape:\n"
             "   {\n"
-            "     \"sitemap_mermaid\": \"mermaid\\nflowchart TD\\n...\",\n"
-            "     \"flows\": [\n"
+            '     "sitemap_mermaid": "mermaid\\nflowchart TD\\n...",\n'
+            '     "flows": [\n'
             "       {\n"
-            "         \"id\": \"IT-FLOW-01\",\n"
-            "         \"name\": \"...\",\n"
-            "         \"requirements_linked\": [\"REQ-1\"],\n"
-            "         \"description\": \"A → B → C\",\n"
-            "         \"diagram_mermaid\": \"mermaid\\nflowchart TD\\n...\"\n"
+            '         "id": "IT-FLOW-01",\n'
+            '         "name": "...",\n'
+            '         "requirements_linked": ["REQ-1"],\n'
+            '         "description": "A → B → C",\n'
+            '         "diagram_mermaid": "mermaid\\nflowchart TD\\n..."\n'
             "       }\n"
             "     ],\n"
-            "     \"clarifying_questions\": [],\n"
-            "     \"notes\": \"\"\n"
+            '     "clarifying_questions": [],\n'
+            '     "notes": ""\n'
             "   }\n\n"
             "Clarity & Traceability\n"
             "- Every flow must map to Requirement IDs (use the IDs from the list).\n"
@@ -1358,7 +1574,10 @@ Documents:
         resp = _oai.chat.completions.create(
             model=global_settings.openai_model,
             messages=[
-                {"role": "system", "content": "Return strict JSON only; no extra text."},
+                {
+                    "role": "system",
+                    "content": "Return strict JSON only; no extra text.",
+                },
                 {"role": "user", "content": prompt},
             ],
             reasoning_effort="minimal",
@@ -1367,13 +1586,16 @@ Documents:
         try:
             data = json.loads(raw)
             assert isinstance(data, dict)
-            # Persist best-effort
+            # Increment suite version first, then persist with this version
+            version_now = _increment_suite_version("Generated test design")
             try:
                 test_design_id = _results_writer.write_test_design(
                     session_id=suite_id_value,
                     suite_id=suite_id_value,
                     content=data,
                     testing_type="integration",
+                    version=version_now,
+                    active=True,
                 )
                 if test_design_id:
                     _SUITE_TEST_DESIGN_ID[suite_id_value] = str(test_design_id)
@@ -1456,7 +1678,7 @@ Documents:
             "- Provide a one-line rationale per viewpoint to aid traceability.\n"
             "- Ensure coverage breadth but keep it concise.\n\n"
             "Return STRICT JSON ONLY with this shape:\n"
-            "{\n  \"viewpoints\": [\n    {\n      \"req_code\": \"REQ-1\",\n      \"req_text\": \"...\",\n      \"items\": [\n        {\"name\": \"Functional\", \"rationale\": \"...\"}\n      ]\n    }\n  ],\n  \"summary\": \"<short>\"\n}\n\n"
+            '{\n  "viewpoints": [\n    {\n      "req_code": "REQ-1",\n      "req_text": "...",\n      "items": [\n        {"name": "Functional", "rationale": "..."}\n      ]\n    }\n  ],\n  "summary": "<short>"\n}\n\n'
             f"Requirement List (JSON):\n{req_ctx}\n\n"
             f"Documents:\n{docs_bundle}\n"
         )
@@ -1464,7 +1686,10 @@ Documents:
         resp = _oai.chat.completions.create(
             model=global_settings.openai_model,
             messages=[
-                {"role": "system", "content": "Return strict JSON only; no extra text."},
+                {
+                    "role": "system",
+                    "content": "Return strict JSON only; no extra text.",
+                },
                 {"role": "user", "content": prompt},
             ],
             reasoning_effort="minimal",
@@ -1473,7 +1698,8 @@ Documents:
         try:
             data = json.loads(raw)
             assert isinstance(data, dict)
-            # Persist best-effort (store JSON content and link to latest test design if available)
+            # Increment suite version first, then persist with this version
+            version_now = _increment_suite_version("Generated viewpoints")
             try:
                 _results_writer.write_viewpoints(
                     session_id=suite_id_value,
@@ -1481,6 +1707,8 @@ Documents:
                     content=data,
                     test_design_id=_SUITE_TEST_DESIGN_ID.get(suite_id_value),
                     testing_type="integration",
+                    version=version_now,
+                    active=True,
                 )
             except Exception:
                 pass
@@ -1745,7 +1973,12 @@ Documents:
         "requirements_extractor",
         model_client=model_client,
         handoffs=["testcase_writer", "planner"],
-        tools=[extract_and_store_requirements, generate_test_design, generate_viewpoints, ask_user],
+        tools=[
+            extract_and_store_requirements,
+            generate_test_design,
+            generate_viewpoints,
+            ask_user,
+        ],
         system_message=(
             "Call extract_and_store_requirements().\n"
             "Reply only: requirements_artifact.\n"
@@ -1821,6 +2054,7 @@ def _write_full_suite_state(
     suite_id: Optional[str],
     agent_state: Dict[str, Any],
     latest_version: Optional[int] = None,
+    version_history: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Write both agent_state and a top-level latest_testcases_version into test_suites.state.
 
@@ -1851,6 +2085,11 @@ def _write_full_suite_state(
                 current["latest_testcases_version"] = int(latest_version)
             except Exception:
                 pass
+        if version_history is not None:
+            try:
+                current["version_history"] = list(version_history)
+            except Exception:
+                pass
         supabase_client.table("test_suites").update({"state": current}).eq(
             "id", suite_id
         ).execute()
@@ -1862,35 +2101,27 @@ async def run_stream_with_suite(
     task: str, suite_id: Optional[str], message_id: Optional[str] = None
 ):
     _message_id = message_id or str(uuid4())
+    user_message_id = str(uuid4())
     local_team = make_team_for_suite(suite_id, _message_id)
-    # Mark suite as chatting/running (best-effort)
-    try:
-        if suite_id:
-            supabase_client.table("test_suites").update({"status": "chatting"}).eq(
-                "id", suite_id
-            ).execute()
-    except Exception as e:
-        print(e)
-    # Best-effort: load prior team state if the suite exists and has stored state
-    try:
-        prior_state = _get_suite_agent_state(suite_id)["agent_state"]
-        if prior_state:
-            await local_team.load_state(prior_state)
-    except Exception as e:
-        # Do not block execution if state loading fails
-        print(f"Error loading team state: {e}")
+
+    if suite_id:
+        supabase_client.table("test_suites").update({"status": "chatting"}).eq(
+            "id", suite_id
+        ).execute()
+
+    prior_state = _get_suite_agent_state(suite_id).get("agent_state")
+    if prior_state:
+        await local_team.load_state(prior_state)
 
     async for event in local_team.run_stream(task=task):
-        print(event)
-        try:
-            _event_payload = json.loads(event.model_dump_json())
-            if not _event_payload.get("messages"):
-                _results_writer.write_event(
-                    suite_id=suite_id, event=_event_payload, message_id=_message_id
-                )
-        except Exception as e:
-            print(f"Error writing event: {e}")
-            pass
+        _event_payload = json.loads(event.model_dump_json())
+        inserted_message_id = (
+            _message_id if _event_payload.get("source") == "user" else user_message_id
+        )
+        if not _event_payload.get("messages"):
+            _results_writer.write_event(
+                suite_id=suite_id, event=_event_payload, message_id=inserted_message_id
+            )
         yield event
 
     # Persist both agent_state and top-level latest_testcases_version (if present in agent_state)
@@ -1916,18 +2147,3 @@ async def run_stream_with_suite(
             ).execute()
     except Exception as e:
         print(f"Error updating suite status to idle: {e}")
-
-
-# -----------------------------
-# Demo runner
-# -----------------------------
-async def main() -> None:
-    # Example user task; pdf names ok (auto-mapped to .txt)
-    task = "Generate me test cases for document test.txt"
-    local_team = make_team_for_suite("demo-suite")
-    await Console(local_team.run_stream(task=task))
-    await model_client.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
