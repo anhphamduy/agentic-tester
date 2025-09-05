@@ -161,10 +161,8 @@ def make_team_for_suite(
                     suite_id=suite_id_value,
                     event={
                         "type": "new_version",
-                        "suite_id": suite_id_value,
                         "version": int(new_version),
                         "description": str(description or ""),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
                     message_id=message_id,
                 )
@@ -235,14 +233,8 @@ Documents:
         except Exception:
             pass
 
-        return {
-            "requirements_artifact": f"db://requirements/{suite_id_value}",
-        }
+        return "Requirements extracted successfully"
 
-    def list_requirement_ids() -> Dict[str, Any]:
-        reqs = _SUITE_REQUIREMENTS.get(suite_id_value) or []
-        ids = [r.get("id") for r in reqs if isinstance(r, dict) and r.get("id")]
-        return {"ids": ids}
 
     def generate_and_store_testcases_for_req(
         req_id: Optional[str] = None, style: str = "json"
@@ -1601,7 +1593,7 @@ Documents:
                     _SUITE_TEST_DESIGN_ID[suite_id_value] = str(test_design_id)
             except Exception:
                 pass
-            return json.dumps(data, ensure_ascii=False)
+            return "Test design generated successfully"
         except Exception as e:
             raise ValueError(f"Invalid JSON from test design generator: {e}")
 
@@ -1712,8 +1704,7 @@ Documents:
                 )
             except Exception:
                 pass
-            # Always return a JSON string for UI rendering and downstream parsing
-            return json.dumps(data, ensure_ascii=False)
+            return "Viewpoints generated successfully"
         except Exception as e:
             raise ValueError(f"Invalid JSON from viewpoints generator: {e}")
 
@@ -2115,6 +2106,9 @@ async def run_stream_with_suite(
 
     async for event in local_team.run_stream(task=task):
         _event_payload = json.loads(event.model_dump_json())
+        _event_payload.pop("id", None)
+        _event_payload.pop("created_at", None)
+        _event_payload.pop("metadata", None)
         inserted_message_id = (
             _message_id if _event_payload.get("source") == "user" else user_message_id
         )

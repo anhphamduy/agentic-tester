@@ -162,7 +162,7 @@ export default function SuiteWorkspace() {
         .select("payload, created_at, message_id")
         .eq("suite_id", suiteIdVal)
         .order("created_at", { ascending: true });
-      console.log(data)
+      console.log(JSON.stringify(data))
       if (error) throw error;
       const result: Message[] = [];
       let currentAi: Message | null = null;
