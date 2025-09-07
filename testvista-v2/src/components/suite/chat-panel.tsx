@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,7 +7,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Send, Bot, User, Upload, Zap, Target, Plus, Lightbulb, ArrowUp, AtSign, MessageSquare, Clock, FileText, File, RotateCcw } from "lucide-react";
+import { Send, Bot, User, Upload, Zap, Target, Plus, Lightbulb, ArrowUp, AtSign, MessageSquare, Clock, FileText, File, RotateCcw, ChevronRight, MoreHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
 import { ArtifactSelectionChips } from "./artifact-selection-chips";
@@ -115,6 +115,28 @@ export function ChatPanel({
     inputRef.current?.focus();
   };
 
+  // Determine the latest version number across all messages (for hiding Restore on latest)
+  const latestVersionAcrossMessages = useMemo(() => {
+    try {
+      let max = -Infinity;
+      for (const m of messages || []) {
+        const text = String(m?.content || "");
+        const re = /<<<VERSION_BUTTON:([\s\S]*?)>>>/g;
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(text)) !== null) {
+          try {
+            const json = JSON.parse(match[1]);
+            const v = typeof json?.version === "number" ? json.version : parseInt(String(json?.version ?? ""), 10);
+            if (!Number.isNaN(v)) max = Math.max(max, v);
+          } catch {}
+        }
+      }
+      return Number.isFinite(max) ? max : undefined;
+    } catch {
+      return undefined;
+    }
+  }, [messages]);
+
   const handleNextStepSelection = (option: "test-cases" | "viewpoints") => {
     onSendMessage(`NEXT_STEP:${option}`);
   };
@@ -198,155 +220,122 @@ export function ChatPanel({
                       <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
                     </div>
                   ) : (
-                    <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words prose-pre:whitespace-pre-wrap prose-pre:break-words prose-pre:max-w-full prose-pre:overflow-x-auto">
-                      <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
-                    </div>
-                  )
-                )}
-                
-                {/* Sample confirmation CTA */}
-                {message.role === "ai" && message.type === "sample-confirmation" && (
-                  <div className="mt-3 mb-3 pt-3 border-t border-border/20 flex items-center justify-between gap-2">
-                    <div className="flex gap-2">
-                      <Button
-                        variant="default"
-                        size="sm"
-                        className="text-xs"
-                        onClick={() => onSendMessage("Yes please")}
-                        disabled={idx < messages.length - 1}
-                      >
-                        Confirm & Generate Full Test Cases
-                      </Button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Quality confirmation CTA: two choices */}
-                {message.role === "ai" && message.type === 'quality-confirmation' && (
-                  <div className="mt-3 mb-3 pt-3 border-t border-border/20 flex items-center justify-between gap-2">
-                    <div className="flex gap-2">
-                      <Button
-                        variant="default"
-                        size="sm"
-                        className="text-xs"
-                        onClick={() => onSendMessage("Yes please")}
-                        disabled={idx < messages.length - 1}
-                      >
-                        Extract requirements first
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="text-xs"
-                        onClick={() => onSendMessage("Generate directly")}
-                        disabled={idx < messages.length - 1}
-                      >
-                        Generate directly
-                      </Button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Requirements feedback CTA: proceed to test cases */}
-                {message.role === "ai" && message.type === 'requirements-feedback' && (
-                  <div className="mt-3 mb-3 pt-3 border-t border-border/20 flex items-center justify-between gap-2">
-                    <div className="flex gap-2">
-                      <Button
-                        variant="default"
-                        size="sm"
-                        className="text-xs"
-                        onClick={() => onSendMessage("Generate test cases")}
-                        disabled={idx < messages.length - 1}
-                      >
-                        Proceed to Test Cases
-                      </Button>
-                    </div>
-                  </div>
-                )}
-                
-                {/* Version update: full-width banner with actions */}
-                {message.role === "ai" && message.type === 'version-update' && (
-                  <div className="mt-2">
-                    <div className="pt-2 border-t border-border/20">
-                      <div className="w-full flex items-center justify-between gap-2 rounded-md bg-muted/30 border border-border/30 px-3 py-1.5">
-                        <div className="text-xs font-medium text-muted-foreground">
-                          New Version v{String(message.versionNumber ?? message.content).replace(/^v/i, '')}
+                    message.type === "quality-confirmation" ? (
+                      <div>
+                        <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
+                          <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
                         </div>
-                        {onVersionAction && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-7 px-2 text-xs"
-                            onClick={() => onVersionAction({ type: 'restore', versionId: String(message.versionNumber ?? message.content) })}
-                            disabled={(() => {
-                              const v = parseInt(String(message.versionNumber ?? message.content), 10);
-                              return !Number.isFinite(v) || (latestTestcasesVersion !== undefined && v >= latestTestcasesVersion);
-                            })()}
-                          >
-                            <RotateCcw className="mr-2 h-3.5 w-3.5" /> Restore
-                          </Button>
-                        )}
+                        <div className="mt-3 flex gap-2">
+                          <Button size="sm" onClick={() => onSendMessage("Extract requirements first")}>Better quality</Button>
+                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Just generate test cases")}>Just generate</Button>
+                        </div>
                       </div>
-                    </div>
-                  </div>
-                )}
+                    ) : message.type === "sample-confirmation" ? (
+                      <div>
+                        <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
+                          <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
+                        </div>
+                        <div className="mt-3 flex gap-2">
+                          <Button size="sm" onClick={() => onSendMessage("Yes please")}>Yes</Button>
+                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Another sample")}>Another sample</Button>
+                        </div>
+                      </div>
+                    ) : (
+                      (() => {
+                        const content = (message.content || '').trim();
+                        const hasVersionButton = content.includes('<<<VERSION_BUTTON:');
+                        if (!hasVersionButton) {
+                          if (message.type === 'requirements-feedback') {
+                            return (
+                              <div>
+                                <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
+                                  <ReactMarkdown>{content}</ReactMarkdown>
+                                </div>
+                                <div className="mt-3 flex gap-2">
+                                  <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")}>Continue to generate test cases</Button>
+                                </div>
+                              </div>
+                            );
+                          }
+                          return (
+                            <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words prose-pre:whitespace-pre-wrap prose-pre:break-words prose-pre:max-w-full prose-pre:overflow-x-auto">
+                              <ReactMarkdown>{content}</ReactMarkdown>
+                            </div>
+                          );
+                        }
+                        const segments: Array<{ kind: 'text'; text: string } | { kind: 'version'; version: number; description: string }> = [];
+                        try {
+                          const re = /<<<VERSION_BUTTON:([\s\S]*?)>>>/g;
+                          let lastIndex = 0;
+                          let match: RegExpExecArray | null;
+                          while ((match = re.exec(content)) !== null) {
+                            const idx = match.index;
+                            const before = content.slice(lastIndex, idx);
+                            if (before.trim()) segments.push({ kind: 'text', text: before });
+                            try {
+                              const json = JSON.parse(match[1]);
+                              const v = typeof json?.version === 'number' ? json.version : parseInt(String(json?.version ?? ''), 10);
+                              const d = String(json?.description ?? '');
+                              if (!Number.isNaN(v)) segments.push({ kind: 'version', version: v, description: d });
+                            } catch {
+                              // ignore malformed placeholder
+                            }
+                            lastIndex = re.lastIndex;
+                          }
+                          const after = content.slice(lastIndex);
+                          if (after.trim()) segments.push({ kind: 'text', text: after });
+                        } catch {
+                          // fallback to plain markdown
+                          return (
+                            <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words prose-pre:whitespace-pre-wrap prose-pre:break-words prose-pre:max-w-full prose-pre:overflow-x-auto">
+                              <ReactMarkdown>{content}</ReactMarkdown>
+                            </div>
+                          );
+                        }
 
-                {/* Requirements sample offer CTA */}
-                {message.role === "ai" && message.type === 'requirements-sample-offer' && (
-                  <div className="mt-3 mb-3 pt-3 border-t border-border/20 flex items-center justify-between gap-2">
-                    <div className="flex gap-2">
-                      <Button
-                        variant="default"
-                        size="sm"
-                        className="text-xs"
-                        onClick={() => onSendMessage("Generate Requirements Sample")}
-                        disabled={idx < messages.length - 1}
-                      >
-                        Generate Requirements Sample
-                      </Button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Test cases sample offer CTA */}
-                {message.role === "ai" && message.type === 'testcases-sample-offer' && (
-                  <div className="mt-3 mb-3 pt-3 border-t border-border/20 flex items-center justify-between gap-2">
-                    <div className="flex gap-2">
-                      <Button
-                        variant="default"
-                        size="sm"
-                        className="text-xs"
-                        onClick={() => onSendMessage("Generate Test Cases Sample")}
-                        disabled={idx < messages.length - 1}
-                      >
-                        Generate Test Cases Sample
-                      </Button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Implementation permission chip */}
-                {message.role === "ai" && message.needsImplementation && (
-                  <div className="mt-3 pt-3 border-t border-border/20">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="bg-primary/5 border-primary/20 hover:bg-primary/10 text-primary text-xs"
-                      onClick={() => onSendMessage(`IMPLEMENT_PLAN:${message.id}`)}
-                    >
-                      Implement the plan
-                    </Button>
-                  </div>
-                )}
-                
-                {/* Version Action Chips for messages with version data */}
-                {message.role === "ai" && message.type === "version-action" && message.versionInfo && onVersionAction && (
-                  <div className="mt-3 pt-3 border-t border-border/20">
-                    <VersionActionChips
-                      latestVersion={message.versionInfo}
-                      onAction={onVersionAction}
-                    />
-                  </div>
+                        return (
+                          <div className="space-y-3">
+                            {segments.map((seg, i) => {
+                              if (seg.kind === 'text') {
+                                return (
+                                  <div key={i} className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words prose-pre:whitespace-pre-wrap prose-pre:break-words prose-pre:max-w-full prose-pre:overflow-x-auto">
+                                    <ReactMarkdown>{seg.text.trim()}</ReactMarkdown>
+                                  </div>
+                                );
+                              }
+                              return (
+                                <div key={i} className="my-2">
+                                  <div className="rounded-xl border border-border/60 bg-muted/30 px-4 py-3">
+                                    <div className="flex items-start justify-between gap-3">
+                                      <div className="min-w-0 flex-1">
+                                        <div className="text-sm font-medium whitespace-pre-wrap break-words">{seg.description || 'Untitled change'}</div>
+                                        <div className="mt-1 text-xs text-muted-foreground">v{seg.version}</div>
+                                      </div>
+                                      {!(latestVersionAcrossMessages != null && seg.version === latestVersionAcrossMessages) && (
+                                        <div className="flex items-center gap-2">
+                                          <button
+                                            onClick={() => onVersionAction?.({ type: 'restore', versionId: String(seg.version) })}
+                                            className="text-xs font-medium px-2 py-1 rounded border border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted"
+                                          >
+                                            Restore
+                                          </button>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                            {message.type === 'requirements-feedback' && (
+                              <div className="mt-1">
+                                <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")}>Continue to generate test cases</Button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()
+                    )
+                  )
                 )}
                 
                 <span className="text-xs opacity-70 mt-1 block">

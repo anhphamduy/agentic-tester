@@ -32,6 +32,7 @@ interface Message {
     | "version-action"
     | "sample-confirmation"
     | "quality-confirmation"
+    | "requirements-feedback"
     | "version-update";
   needsImplementation?: boolean;
   implementationPlan?: string;
@@ -162,101 +163,82 @@ export default function SuiteWorkspace() {
         .select("payload, created_at, message_id")
         .eq("suite_id", suiteIdVal)
         .order("created_at", { ascending: true });
-      console.log(JSON.stringify(data))
-      if (error) throw error;
-      const result: Message[] = [];
-      let currentAi: Message | null = null;
-      let callIdToIndex: Record<string, number> = {};
-      let aiLines: string[] = [];
+      console.log(data)
+      console.log(JSON.stringify(data, null, 2))
 
-      const ensureAiBlock = (ts: string) => {
-        if (!currentAi) {
-          currentAi = {
-            id: `ai-${ts}`,
-            role: "ai",
-            content: "",
-            timestamp: new Date(ts),
-            type: "normal",
-          };
-          aiLines = [];
-          callIdToIndex = {};
-          result.push(currentAi);
-        }
-      };
-
+        if (error) throw error;
+      const grouped: Record<string, { createdAt: string; user: string[]; ai: string[]; aiType?: Message["type"] }> = {};
       (data || []).forEach((ev: any) => {
-        let obj: any;
+        let parsed: any;
         try {
-          obj =
-            typeof ev.payload === "string"
-              ? JSON.parse(ev.payload)
-              : ev.payload;
+          parsed = typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload;
         } catch {
-          obj = ev.payload;
+          parsed = ev.payload;
         }
-        if (obj && obj.source === "user") {
-          // Start a new user+AI block
-          result.push({
-            id: ev.message_id,
-            role: "user",
-            content:
-              typeof obj.content === "string"
-                ? obj.content
-                : String(obj.content ?? ""),
-            timestamp: new Date(ev.created_at),
-            type: "normal",
-          });
-          currentAi = {
-            id: `ai-${ev.message_id}`,
-            role: "ai",
-            content: "",
-            timestamp: new Date(ev.created_at),
-            type: "normal",
-          };
-          aiLines = [];
-          callIdToIndex = {};
-          result.push(currentAi);
-          return;
+        const isUser = parsed && parsed.source === "user";
+        const mid = String(ev.message_id);
+        const special = isUser ? null : renderSpecialAiEvent(parsed);
+        const isQualityAsk = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "quality_confirmation");
+        const isSampleAsk = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "sample_confirmation");
+        const isReqFeedback = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "requirements_feedback");
+        const aiTextMessage = !isUser && String(parsed?.type || "") === "TextMessage" && typeof parsed?.content === "string"
+          ? normalizeMarkdown(String(parsed?.content ?? "")).replace(/\bTERMINATE\b/gi, "").trim()
+          : null;
+        const codeBlock = isUser
+          ? (typeof parsed?.content === "string"
+              ? parsed.content
+              : String(parsed?.content ?? ""))
+          : (
+              (isQualityAsk || isSampleAsk || isReqFeedback) && typeof (parsed?.response_to_user || parsed?.responseToUser) === "string"
+                ? String(parsed?.response_to_user || parsed?.responseToUser)
+                : (aiTextMessage ?? special ?? (
+              "```json\n" +
+              JSON.stringify(
+                { payload: parsed, created_at: ev.created_at, message_id: ev.message_id },
+                null,
+                2
+              ) +
+              "\n```"
+            ))
+            );
+        const g = (grouped[mid] ||= { createdAt: ev.created_at, user: [], ai: [], aiType: undefined });
+        // track earliest createdAt
+        if (new Date(ev.created_at).getTime() < new Date(g.createdAt).getTime()) {
+          g.createdAt = ev.created_at;
         }
-
-        const formatted = formatTeamEvent(obj);
-        if (!formatted) return;
-        const meta = extractToolMeta(obj);
-        ensureAiBlock(ev.created_at);
-        const msgType = (formatted as any)?.messageType as
-          | "sample-confirmation"
-          | "quality-confirmation"
-          | "requirements-feedback"
-          | "version-update"
-          | undefined;
-
-        if (msgType) {
-          if (msgType === "version-update") {
-            // Do not inject raw version text into the chat body; only tag the message
-            currentAi!.type = msgType as any;
-            (currentAi as any).versionNumber = (formatted as any)?.version as
-              | number
-              | undefined;
-          } else {
-            // For confirmation-style messages, show only the response_to_user, clear prior noise
-            aiLines = [formatted.content];
-            callIdToIndex = {};
-            currentAi!.type = msgType as any;
-          }
-        } else if (meta.isRequest && meta.callId) {
-          aiLines.push(`⏳ ${formatted.content}`);
-          callIdToIndex[meta.callId] = aiLines.length - 1;
-        } else if (meta.isExecution && meta.callId) {
-          const idx = callIdToIndex[meta.callId];
-          if (typeof idx === "number" && aiLines[idx])
-            aiLines[idx] = `✅ ${formatted.content}`;
-          else aiLines.push(`✅ ${formatted.content}`);
-        } else {
-          if (formatted.content) aiLines.push(`• ${formatted.content}`);
+        if (isUser) g.user.push(codeBlock);
+        else {
+          g.ai.push(codeBlock);
+          if (isQualityAsk) g.aiType = "quality-confirmation" as const;
+          else if (isSampleAsk) g.aiType = "sample-confirmation" as const;
+          else if (isReqFeedback) g.aiType = "requirements-feedback" as const;
         }
-        currentAi!.content = aiLines.join("\n\n");
-        currentAi!.timestamp = new Date(ev.created_at);
       });
+
+      const result: Message[] = Object.entries(grouped)
+        .sort((a, b) => new Date(a[1].createdAt).getTime() - new Date(b[1].createdAt).getTime())
+        .flatMap(([mid, g]) => {
+          const msgs: Message[] = [];
+          if (g.user.length) {
+            msgs.push({
+              id: `user-${mid}`,
+              role: "user",
+              content: g.user.join("\n\n"),
+              timestamp: new Date(g.createdAt),
+              type: "normal",
+            });
+          }
+          if (g.ai.length) {
+            msgs.push({
+              id: `ai-${mid}`,
+              role: "ai",
+              content: g.ai.join("\n\n"),
+              timestamp: new Date(g.createdAt),
+              type: g.aiType || "normal",
+            });
+          }
+          return msgs;
+        });
 
       setMessages(result);
       setInitialChatLoading(false);
@@ -362,6 +344,136 @@ export default function SuiteWorkspace() {
     } catch {
       return rows || [];
     }
+  };
+  // Special rendering for certain AI tool events
+  const renderSpecialAiEvent = (payload: any): string | null => {
+    try {
+      const type = payload?.type;
+      const source = payload?.source;
+      const first = Array.isArray(payload?.content) ? payload.content[0] : undefined;
+      const name = first?.name as string | undefined;
+      // Version announcement placeholder (handled specially in ChatPanel)
+      if (type === "new_version") {
+        const version = (() => {
+          try {
+            const v = payload?.version;
+            return typeof v === "number" ? v : parseInt(String(v ?? ""), 10);
+          } catch { return undefined; }
+        })();
+        const description = String(payload?.description ?? "");
+        const body = JSON.stringify({ version, description });
+        return `<<<VERSION_BUTTON:${body}>>>`;
+      }
+      // Requirements extractor progress messages
+      if (type === "ToolCallRequestEvent" && source === "requirements_extractor" && name === "extract_and_store_requirements") {
+        return "⏳ Generating requirements...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "requirements_extractor" && name === "extract_and_store_requirements") {
+        return "✅ Requirements generated successfully.";
+      }
+      if (type === "ToolCallRequestEvent" && source === "requirements_extractor" && name === "generate_test_design") {
+        return "⏳ I'm generating test design...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "requirements_extractor" && name === "generate_test_design") {
+        return "✅ Test design generated successfully.";
+      }
+      if (type === "ToolCallRequestEvent" && source === "requirements_extractor" && name === "generate_viewpoints") {
+        return "⏳ I'm generating viewpoints...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "requirements_extractor" && name === "generate_viewpoints") {
+        return "✅ Viewpoints generated successfully.";
+      }
+      // Testcase writer: integration test cases generation
+      if (type === "ToolCallRequestEvent" && source === "testcase_writer" && name === "generate_integration_testcases_for_req") {
+        return "⏳ I'm generating integration test cases...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "testcase_writer" && name === "generate_integration_testcases_for_req") {
+        return "✅ Integration test cases generated.";
+      }
+      // Testcase writer: edit test cases flow
+      if (type === "ToolCallRequestEvent" && source === "testcase_writer" && name === "edit_testcases_for_req") {
+        return "⏳ I'm editing test cases...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "testcase_writer" && name === "edit_testcases_for_req") {
+        return "✅ Edited test cases.";
+      }
+      if (type === "ToolCallRequestEvent" && source === "planner" && name === "transfer_to_fetcher") {
+        return "⏳ I'm transferring to the fetcher...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "planner" && name === "transfer_to_fetcher") {
+        return "✅ Transfer complete.";
+      }
+      if (type === "ToolCallRequestEvent" && source === "fetcher" && name === "store_docs_from_blob") {
+        let docs: string[] = [];
+        try {
+          const args = first?.arguments ? JSON.parse(first.arguments) : {};
+          if (Array.isArray(args?.doc_names)) docs = args.doc_names;
+        } catch {}
+        const suffix = docs.length ? `: ${docs.join(", ")}` : "";
+        return `⏳ I'm fetching documents${suffix}...`;
+      }
+      if (type === "ToolCallExecutionEvent" && source === "fetcher" && name === "store_docs_from_blob") {
+        // Parse result content and render friendly summary
+        let stored: string[] = [];
+        let missing: string[] = [];
+        try {
+          const raw = String(first?.content ?? "");
+          let parsed: any;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            // Try converting python-like dict to JSON
+            const normalized = raw
+              .replace(/'/g, '"')
+              .replace(/\bNone\b/g, 'null')
+              .replace(/\bTrue\b/g, 'true')
+              .replace(/\bFalse\b/g, 'false');
+            parsed = JSON.parse(normalized);
+          }
+          if (Array.isArray(parsed?.stored)) stored = parsed.stored;
+          if (Array.isArray(parsed?.missing)) missing = parsed.missing;
+        } catch {}
+        const storedText = stored.length ? stored.join(", ") : "none";
+        const missingText = missing.length ? missing.join(", ") : "none";
+        return `✅ Documents fetched. Stored: ${storedText}. Missing: ${missingText}.`;
+      }
+
+      // Planner: identify_gaps loading/result
+      if (type === "ToolCallRequestEvent" && source === "planner" && name === "identify_gaps") {
+        return "⏳ I'm analyzing gaps in the documents...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "planner" && name === "identify_gaps") {
+        const details = normalizeMarkdown(String(first?.content ?? ""));
+        return details || "Gap analysis completed.";
+      }
+
+      // Planner: list/get test case information (concise)
+      if (type === "ToolCallRequestEvent" && source === "planner" && name === "get_testcases_info") {
+        return "⏳ I'm retrieving test case information...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "planner" && name === "get_testcases_info") {
+        return "✅ Test case information retrieved.";
+      }
+
+      // Planner: list/get requirements information (concise)
+      if (type === "ToolCallRequestEvent" && source === "planner" && name === "get_requirements_info") {
+        return "⏳ I'm retrieving requirements information...";
+      }
+      if (type === "ToolCallExecutionEvent" && source === "planner" && name === "get_requirements_info") {
+        return "✅ Requirements information retrieved.";
+      }
+
+      // Generic transfer_to_* handling for all agents (planner/fetcher/requirements_extractor/testcase_writer)
+      if (type === "ToolCallRequestEvent" && typeof name === "string" && name.startsWith("transfer_to_")) {
+        const target = name.replace("transfer_to_", "").replace(/_/g, " ");
+        return `⏳ Transferring to ${target}...`;
+      }
+      if (type === "ToolCallExecutionEvent" && typeof name === "string" && name.startsWith("transfer_to_")) {
+        const target = name.replace("transfer_to_", "").replace(/_/g, " ");
+        return `✅ Transfer to ${target} complete.`;
+      }
+    } catch {}
+    return null;
   };
   const flattenTestCaseRows = (rows: any[]): any[] => {
     try {
@@ -476,898 +588,7 @@ export default function SuiteWorkspace() {
       return rows || [];
     }
   };
-  const formatTeamEvent = (
-    raw: any
-  ): {
-    role: "ai" | "user";
-    content: string;
-    messageType?:
-      | "sample-confirmation"
-      | "quality-confirmation"
-      | "requirements-feedback"
-      | "requirements-sample-offer"
-      | "testcases-sample-offer"
-      | "version-update";
-    version?: number;
-  } | null => {
-    console.log(raw);
-    const type = raw?.type;
-    const source = raw?.source;
-
-    // Handle bulk test case edits -> version update message
-    if (type === "testcases_edited_bulk") {
-      try {
-        const firstEdit =
-          Array.isArray(raw?.edits) && raw.edits.length > 0 ? raw.edits[0] : {};
-        const newVersion =
-          typeof raw?.new_version === "number"
-            ? raw.new_version
-            : typeof firstEdit?.new_version === "number"
-            ? firstEdit.new_version
-            : typeof raw?.new_testcases?.version === "number"
-            ? raw.new_testcases.version
-            : undefined;
-        if (newVersion != null) {
-          return {
-            role: "ai",
-            content: String(newVersion),
-            messageType: "version-update",
-            version: Number(newVersion),
-          } as any;
-        }
-      } catch {}
-      return null;
-    }
-    // Direct nested event payloads (e.g., {'event': {'type': 'ask_user', 'event_type': 'sample_confirmation', 'response_to_user': '...'}})
-    if (
-      raw?.event &&
-      typeof raw.event === "object" &&
-      raw.event.type === "ask_user"
-    ) {
-      const eventType = raw.event.event_type || raw.event.eventType || "";
-      const responseText = normalizeMarkdown(
-        String(
-          raw.event.response_to_user ?? raw.event.responseToUser ?? ""
-        ).trim()
-      );
-      if (eventType === "sample_confirmation" && responseText) {
-        return {
-          role: "ai",
-          content: responseText,
-          messageType: "sample-confirmation",
-        };
-      }
-      if (eventType === "quality_confirmation" && responseText) {
-        const normalized = responseText.replace(
-          /\bCONTINUE\b/g,
-          "Generate directly"
-        );
-        return {
-          role: "ai",
-          content: normalized,
-          messageType: "quality-confirmation",
-        };
-      }
-      if (eventType === "requirements_feedback" && responseText) {
-        return {
-          role: "ai",
-          content: responseText,
-          messageType: "requirements-feedback",
-        };
-      }
-      if (eventType === "requirements_sample_offer" && responseText) {
-        return {
-          role: "ai",
-          content: responseText,
-          messageType: "requirements-sample-offer",
-        } as any;
-      }
-      if (eventType === "testcases_sample_offer" && responseText) {
-        return {
-          role: "ai",
-          content: responseText,
-          messageType: "testcases-sample-offer",
-        } as any;
-      }
-      if (responseText) return { role: "ai", content: responseText };
-    }
-
-    if (type === "HandoffMessage" || type === "ThoughtEvent") return null;
-
-    // Ensure plain TextMessage strings are surfaced
-    if (type === "TextMessage" && typeof raw?.content === "string") {
-      return { role: "ai", content: normalizeMarkdown(String(raw.content)) };
-    }
-
-    if (type === "ToolCallRequestEvent") {
-      const first = Array.isArray(raw?.content) ? raw.content[0] : undefined;
-      const name = first?.name as string | undefined;
-      if (source === "testcase_writer" && name === "edit_testcases_for_req") {
-        try {
-          const jsonBlock =
-            "```json\n" + JSON.stringify(raw, null, 2) + "\n```";
-          return {
-            role: "ai",
-            content: `AI is editing test cases\n\n${jsonBlock}`,
-          };
-        } catch {
-          return { role: "ai", content: `AI is editing test cases` };
-        }
-      }
-      if (source === "planner" && name === "generate_preview") {
-        return { role: "ai", content: `I'm generating a short preview...` };
-      }
-      if (source === "planner" && name === "identify_gaps") {
-        let focus = "";
-        try {
-          const args = first?.arguments ? JSON.parse(first.arguments) : {};
-          const t =
-            typeof args?.testing_type === "string" ? args.testing_type : "";
-          if (t) focus = ` with a ${t} testing focus`;
-        } catch {}
-        return {
-          role: "ai",
-          content: `I'm analyzing your documents to identify gaps and ambiguities${focus}...`,
-        };
-      }
-      if (source === "planner" && name === "get_requirements_info") {
-        return {
-          role: "ai",
-          content: `I'm checking existing requirements and answering your question...`,
-        };
-      }
-      if (source === "planner" && name === "get_testcases_info") {
-        return {
-          role: "ai",
-          content: `I'm checking existing test cases and answering your question...`,
-        };
-      }
-      if (
-        source === "planner" &&
-        name === "generate_direct_testcases_on_docs"
-      ) {
-        return {
-          role: "ai",
-          content: `I'm generating test cases directly from your documents...`,
-        };
-      }
-      if (
-        source === "testcase_writer" &&
-        name === "generate_direct_testcases_on_docs"
-      ) {
-        return {
-          role: "ai",
-          content: `I'm generating test cases directly from your documents...`,
-        };
-      }
-      if (
-        source === "testcase_writer" &&
-        name === "generate_integration_testcases_for_req"
-      ) {
-        return {
-          role: "ai",
-          content: `I'm generating integration test cases...`,
-        };
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "generate_test_design"
-      ) {
-        return {
-          role: "ai",
-          content: `I'm preparing integration test design (sitemap + flows)...`,
-        };
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "generate_viewpoints"
-      ) {
-        return {
-          role: "ai",
-          content: `I'm generating per-requirement test viewpoints...`,
-        };
-      }
-      if (source === "planner" && name === "transfer_to_fetcher") {
-        return null;
-      }
-      if (name === "transfer_to_planner") {
-        return { role: "ai", content: `I'm thinking...` };
-      }
-      if (name === "transfer_to_requirements_extractor") {
-        return {
-          role: "ai",
-          content: `Transferring to requirements_extractor...`,
-        };
-      }
-      if (source === "planner" && name === "transfer_to_testcase_writer") {
-        return {
-          role: "ai",
-          content: `Transferring to testcase_writer to generate test cases...`,
-        };
-      }
-      if (
-        source === "fetcher" &&
-        name === "transfer_to_requirements_extractor"
-      ) {
-        return { role: "ai", content: `I'm now analyzing the requirements...` };
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "extract_and_store_requirements"
-      ) {
-        return {
-          role: "ai",
-          content: `I'm now extracting the requirements...`,
-        };
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "transfer_to_testcase_writer"
-      ) {
-        return {
-          role: "ai",
-          content: `I'm now writing test cases based on the requirements...`,
-        };
-      }
-      if (source === "testcase_writer" && name === "list_requirement_ids") {
-        return {
-          role: "ai",
-          content: `I'm identifying requirements to cover with test cases...`,
-        };
-      }
-      if (
-        source === "testcase_writer" &&
-        name === "generate_and_store_testcases_for_req"
-      ) {
-        let reqId = "";
-        try {
-          const args = first?.arguments ? JSON.parse(first.arguments) : {};
-          reqId = typeof args?.req_id === "string" ? args.req_id : "";
-        } catch {}
-        const forText = reqId ? ` for ${reqId}` : "";
-        return { role: "ai", content: `I'm writing test cases${forText}...` };
-      }
-      if (source === "fetcher" && name === "store_docs_from_blob") {
-        let docs: string[] = [];
-        try {
-          const args = first?.arguments ? JSON.parse(first.arguments) : {};
-          if (Array.isArray(args?.doc_names)) docs = args.doc_names;
-        } catch {}
-        const list = docs.length ? docs.join(", ") : "documents";
-        return { role: "ai", content: `I'm fetching and analyzing ${list}...` };
-      }
-    }
-
-    if (type === "ToolCallExecutionEvent") {
-      const first = Array.isArray(raw?.content) ? raw.content[0] : undefined;
-      const name = first?.name as string | undefined;
-      if (source === "planner" && name === "generate_preview") {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return { role: "ai", content: details || "Preview generated." };
-      }
-      if (
-        source === "testcase_writer" &&
-        name === "generate_integration_testcases_for_req"
-      ) {
-        const raw = String(first?.content ?? "");
-        let generated = 0;
-        let failed = 0;
-        try {
-          let parsed: any;
-          try {
-            parsed = JSON.parse(raw);
-          } catch {
-            parsed = JSON.parse(raw.replace(/'/g, '"'));
-          }
-          generated = Number(parsed?.generated ?? 0) || 0;
-          failed = Number(parsed?.failed ?? 0) || 0;
-        } catch {}
-        const main =
-          generated || failed
-            ? `Integration test cases generated: ${generated} successful, ${failed} failed.`
-            : "Integration test cases generation finished.";
-        return { role: "ai", content: main };
-      }
-      if (source === "planner" && name === "identify_gaps") {
-        const detailsRaw = String(first?.content ?? "");
-        const details = normalizeMarkdown(detailsRaw)
-          .replace(/\bTERMINATE\b/g, "")
-          .trim();
-        return {
-          role: "ai",
-          content: details || "No significant gaps detected.",
-        };
-      }
-      if (source === "planner" && name === "get_requirements_info") {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return {
-          role: "ai",
-          content: details || "Answered your requirements question.",
-        };
-      }
-      if (source === "planner" && name === "get_testcases_info") {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return {
-          role: "ai",
-          content: details || "Answered your test cases question.",
-        };
-      }
-      if (
-        source === "planner" &&
-        name === "generate_direct_testcases_on_docs"
-      ) {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return {
-          role: "ai",
-          content: details || "Generated direct test cases.",
-        };
-      }
-      if (
-        source === "testcase_writer" &&
-        name === "generate_direct_testcases_on_docs"
-      ) {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return {
-          role: "ai",
-          content: details || "Generated direct test cases.",
-        };
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "generate_test_design"
-      ) {
-        const raw = String(first?.content ?? "");
-        try {
-          const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-          const flows = Array.isArray(parsed?.flows) ? parsed.flows : [];
-          const flowCount = flows.length;
-          const sample = flows[0] || {};
-          const sampleName = sample?.name || sample?.id || "";
-          const header = flowCount
-            ? `Integration test design ready with ${flowCount} flows.`
-            : "Integration test design generated.";
-          const tail = sampleName ? ` Example: ${sampleName}.` : "";
-          return { role: "ai", content: `${header}${tail}` };
-        } catch {
-          const details = normalizeMarkdown(raw);
-          return {
-            role: "ai",
-            content: details || "Integration test design generated.",
-          };
-        }
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "generate_viewpoints"
-      ) {
-        const raw = String(first?.content ?? "");
-        try {
-          const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-          const items = Array.isArray(parsed?.viewpoints)
-            ? parsed.viewpoints
-            : [];
-          const reqCount = items.length;
-          const sample = items[0] || {};
-          const reqCode = sample?.req_code || sample?.requirement_id || "";
-          const vp = Array.isArray(sample?.items) ? sample.items : [];
-          const names = vp
-            .slice(0, 3)
-            .map((x: any) => x?.name)
-            .filter(Boolean)
-            .join(", ");
-          const header = reqCount
-            ? `Generated viewpoints for ${reqCount} requirement(s).`
-            : "Generated viewpoints.";
-          const tail =
-            reqCode && names ? ` Example (${reqCode}): ${names}.` : "";
-          return { role: "ai", content: `${header}${tail}` };
-        } catch {
-          const details = normalizeMarkdown(raw);
-          return { role: "ai", content: details || "Generated viewpoints." };
-        }
-      }
-      if (source === "planner" && name === "transfer_to_fetcher") {
-        return null;
-      }
-      if (name === "transfer_to_requirements_extractor") {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return {
-          role: "ai",
-          content: details || "Transferred to requirements_extractor.",
-        };
-      }
-      if (source === "planner" && name === "transfer_to_testcase_writer") {
-        return null; // internal routing confirmation, suppress
-      }
-      if (name === "transfer_to_planner") {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return { role: "ai", content: details || "Transferred to planner." };
-      }
-
-      // Planner: ask_user -> sample_confirmation or quality_confirmation with response_to_user and CTA(s)
-      if (source === "planner" && name === "ask_user") {
-        const details = String(first?.content ?? "");
-        let eventType = "";
-        let responseText = "";
-        // Try JSON first
-        try {
-          const parsed = JSON.parse(details);
-          eventType = parsed?.event?.event_type || "";
-          responseText = normalizeMarkdown(
-            parsed?.event?.response_to_user || ""
-          );
-        } catch {
-          // Fallback parse for python-like dict
-          const et = details.match(/'event_type'\s*:\s*'([^']+)'/);
-          const rtSingle = details.match(
-            /'response_to_user'\s*:\s*'([\s\S]*?)'\s*(?:,|\})/
-          );
-          const rtDouble = details.match(
-            /'response_to_user'\s*:\s*"([\s\S]*?)"\s*(?:,|\})/
-          );
-          eventType = et?.[1] || "";
-          responseText = normalizeMarkdown(
-            (rtSingle?.[1] || rtDouble?.[1] || "").trim()
-          );
-        }
-        if (eventType === "sample_confirmation" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "sample-confirmation",
-          };
-        }
-        if (eventType === "quality_confirmation" && responseText) {
-          // Normalize CTA wording to "Yes please" / "Generate directly"
-          const normalized = responseText.replace(
-            /\bCONTINUE\b/g,
-            "Generate directly"
-          );
-          return {
-            role: "ai",
-            content: normalized,
-            messageType: "quality-confirmation",
-          };
-        }
-        if (eventType === "requirements_feedback" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-feedback",
-          };
-        }
-        if (eventType === "requirements_sample_offer" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-sample-offer",
-          } as any;
-        }
-        if (eventType === "testcases_sample_offer" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "testcases-sample-offer",
-          } as any;
-        }
-        if (responseText) return { role: "ai", content: responseText };
-        return null;
-      }
-      // Requirements extractor: ask_user -> requirements_feedback with response_to_user and CTA
-      if (source === "requirements_extractor" && name === "ask_user") {
-        const details = String(first?.content ?? "");
-        let eventType = "";
-        let responseText = "";
-        // Try JSON first
-        try {
-          const parsed = JSON.parse(details);
-          eventType = parsed?.event?.event_type || "";
-          responseText = normalizeMarkdown(
-            parsed?.event?.response_to_user || ""
-          );
-        } catch {
-          // Fallback parse for python-like dict
-          const et = details.match(/'event_type'\s*:\s*'([^']+)'/);
-          const rtSingle = details.match(
-            /'response_to_user'\s*:\s*'([\s\S]*?)'\s*(?:,|\})/
-          );
-          const rtDouble = details.match(
-            /'response_to_user'\s*:\s*"([\s\S]*?)"\s*(?:,|\})/
-          );
-          eventType = et?.[1] || "";
-          responseText = normalizeMarkdown(
-            (rtSingle?.[1] || rtDouble?.[1] || "").trim()
-          );
-        }
-        if (eventType === "sample_confirmation" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "sample-confirmation",
-          };
-        }
-        if (eventType === "quality_confirmation" && responseText) {
-          // Normalize CTA wording to "Yes please" / "Generate directly"
-          const normalized = responseText.replace(
-            /\bCONTINUE\b/g,
-            "Generate directly"
-          );
-          return {
-            role: "ai",
-            content: normalized,
-            messageType: "quality-confirmation",
-          };
-        }
-        if (eventType === "requirements_feedback" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-feedback",
-          };
-        }
-        if (responseText) return { role: "ai", content: responseText };
-        return null;
-      }
-
-      if (name === "transfer_to_planner") {
-        return null; // internal routing confirmation, suppress
-      }
-      if (name === "transfer_to_requirements_extractor") {
-        return { role: "ai", content: `I'm now extracting requirements...` };
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "extract_and_store_requirements"
-      ) {
-        return {
-          role: "ai",
-          content: `Requirements extracted. Now check the Requirements tab — I'm done.`,
-        };
-      }
-      if (
-        source === "requirements_extractor" &&
-        name === "transfer_to_testcase_writer"
-      ) {
-        return null; // internal routing confirmation, suppress
-      }
-      if (
-        source === "testcase_writer" &&
-        name === "generate_and_store_testcases_for_req"
-      ) {
-        // Try to extract req_id from content
-        let reqId = "";
-        try {
-          const details = String(first?.content ?? "");
-          const match = details.match(/'req_id':\s*'([^']+)'/);
-          if (match && match[1]) reqId = match[1];
-        } catch {}
-        const which = reqId ? ` for ${reqId}` : "";
-        return {
-          role: "ai",
-          content: `Test cases${which} are ready. Now check the Test Cases tab.`,
-        };
-      }
-      if (source === "testcase_writer" && name === "list_requirement_ids") {
-        // summarize count of ids
-        let count = 0;
-        try {
-          const details = String(first?.content ?? "");
-          const parsed = JSON.parse(details.replace(/'/g, '"'));
-          if (Array.isArray(parsed?.ids)) count = parsed.ids.length;
-        } catch {}
-        if (count > 0)
-          return {
-            role: "ai",
-            content: `Found ${count} requirements to cover.`,
-          };
-        return null;
-      }
-      if (source === "testcase_writer" && name === "edit_testcases_for_req") {
-        const details = String(first?.content ?? "");
-        let editedCount = 0;
-        let summary = "";
-        let reqCodes: string[] = [];
-        let newVersions: (number | string)[] = [];
-        try {
-          let parsed: any;
-          try {
-            parsed = JSON.parse(details);
-          } catch {
-            parsed = JSON.parse(details.replace(/'/g, '"'));
-          }
-          editedCount = Number(parsed?.edited_count ?? 0) || 0;
-          if (Array.isArray(parsed?.results)) {
-            reqCodes = parsed.results
-              .map((r: any) => r?.req_code || r?.requirement_id)
-              .filter(Boolean);
-            newVersions = parsed.results
-              .map((r: any) => r?.new_version)
-              .filter((v: any) => v != null);
-          }
-          summary = typeof parsed?.summary === "string" ? parsed.summary : "";
-        } catch {}
-        if (!editedCount) {
-          const m = details.match(/'edited_count'\s*:\s*(\d+)/);
-          editedCount = m ? Number(m[1]) : 0;
-        }
-        if (reqCodes.length === 0) {
-          const m1 = details.match(/'req_code'\s*:\s*'([^']+)'/);
-          const m2 = details.match(/'requirement_id'\s*:\s*'([^']+)'/);
-          if (m1) reqCodes.push(m1[1]);
-          else if (m2) reqCodes.push(m2[1]);
-        }
-        if (newVersions.length === 0) {
-          const m = details.match(/'new_version'\s*:\s*(\d+)/);
-          if (m) newVersions.push(Number(m[1]));
-        }
-        if (!summary) {
-          const m = details.match(/'summary'\s*:\s*'([\s\S]*?)'\s*(?:,|\})/);
-          if (m) summary = m[1];
-        }
-        const reqText = reqCodes.length
-          ? ` for ${[...new Set(reqCodes)].join(", ")}`
-          : "";
-        const versionText = newVersions.length
-          ? `; new version ${newVersions[newVersions.length - 1]}`
-          : "";
-        const countText = editedCount
-          ? `${editedCount} test case${editedCount > 1 ? "s" : ""}`
-          : "test cases";
-        const summaryText = summary ? ` ${summary}` : "";
-        return {
-          role: "ai",
-          content: `Edited ${countText}${reqText}${versionText}.${summaryText}`,
-        };
-      }
-      if (source === "fetcher" && name === "store_docs_from_blob") {
-        const details = String(first?.content ?? "");
-        let stored: string[] = [];
-        let missing: string[] = [];
-        try {
-          const parsed = JSON.parse(details);
-          stored = Array.isArray(parsed?.stored) ? parsed.stored : stored;
-          missing = Array.isArray(parsed?.missing) ? parsed.missing : missing;
-        } catch {
-          const sMatch = details.match(/'stored': \[(.*?)\]/);
-          const mMatch = details.match(/'missing': \[(.*?)\]/);
-          if (sMatch && sMatch[1])
-            stored = sMatch[1]
-              .split(",")
-              .map((x) =>
-                x
-                  .trim()
-                  .replace(/^'|"|\s/g, "")
-                  .replace(/'|"$/g, "")
-              )
-              .filter(Boolean);
-          if (mMatch && mMatch[1])
-            missing = mMatch[1]
-              .split(",")
-              .map((x) =>
-                x
-                  .trim()
-                  .replace(/^'|"|\s/g, "")
-                  .replace(/'|"$/g, "")
-              )
-              .filter(Boolean);
-        }
-        const storedText = stored.length
-          ? `Stored: ${stored.join(", ")}`
-          : "Stored: none";
-        const missingText = missing.length
-          ? `Missing: ${missing.join(", ")}`
-          : "Missing: none";
-        return { role: "ai", content: `${storedText}. ${missingText}.` };
-      }
-    }
-
-    if (type === "ToolCallSummaryMessage") {
-      // Some backends emit the important ask_user payload inside this summary as a string
-      try {
-        const details = String(raw?.content ?? "");
-        let eventType = "";
-        let responseText = "";
-        // Try strict JSON first
-        try {
-          const parsed = JSON.parse(details);
-          const ev = parsed?.event || {};
-          eventType = ev?.event_type || ev?.eventType || "";
-          responseText = normalizeMarkdown(
-            ev?.response_to_user || ev?.responseToUser || ""
-          );
-        } catch {
-          // Fallback: python-like dict with single quotes
-          const et = details.match(/'event_type'\s*:\s*'([^']+)'/);
-          const rtSingle = details.match(
-            /'response_to_user'\s*:\s*'([\s\S]*?)'\s*(?:,|\})/
-          );
-          const rtDouble = details.match(
-            /"response_to_user"\s*:\s*"([\s\S]*?)"\s*(?:,|\})/
-          );
-          eventType = et?.[1] || "";
-          responseText = normalizeMarkdown(
-            (rtSingle?.[1] || rtDouble?.[1] || "").trim()
-          );
-        }
-        if (eventType === "sample_confirmation" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "sample-confirmation",
-          };
-        }
-        if (eventType === "quality_confirmation" && responseText) {
-          const normalized = responseText.replace(
-            /\bCONTINUE\b/g,
-            "Generate directly"
-          );
-          return {
-            role: "ai",
-            content: normalized,
-            messageType: "quality-confirmation",
-          };
-        }
-        if (eventType === "requirements_feedback" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-feedback",
-          };
-        }
-        if (eventType === "requirements_sample_offer" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-sample-offer",
-          } as any;
-        }
-        if (eventType === "testcases_sample_offer" && responseText) {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "testcases-sample-offer",
-          } as any;
-        }
-        if (responseText) return { role: "ai", content: responseText };
-        return null;
-      } catch {
-        return null; // if unparsable, ignore summary
-      }
-    }
-
-    if (typeof raw?.content === "string") {
-      const details = String(raw.content);
-      try {
-        const parsed = JSON.parse(details);
-        const ev = parsed?.event || {};
-        const eventType = ev?.event_type || ev?.eventType || "";
-        const responseText = normalizeMarkdown(
-          String(ev?.response_to_user ?? ev?.responseToUser ?? "").trim()
-        );
-        if (responseText) {
-          if (eventType === "sample_confirmation") {
-            return {
-              role: "ai",
-              content: responseText,
-              messageType: "sample-confirmation",
-            };
-          }
-          if (eventType === "quality_confirmation") {
-            const normalized = responseText.replace(
-              /\bCONTINUE\b/g,
-              "Generate directly"
-            );
-            return {
-              role: "ai",
-              content: normalized,
-              messageType: "quality-confirmation",
-            };
-          }
-          if (eventType === "requirements_feedback") {
-            return {
-              role: "ai",
-              content: responseText,
-              messageType: "requirements-feedback",
-            } as any;
-          }
-          return { role: "ai", content: responseText };
-        }
-      } catch {}
-      // Fallback regex extraction from python-like dict string
-      const et = details.match(/'event_type'\s*:\s*'([^']+)'/);
-      const rtSingle = details.match(
-        /'response_to_user'\s*:\s*'([\s\S]*?)'\s*(?:,|\})/
-      );
-      const rtDouble = details.match(
-        /"response_to_user"\s*:\s*"([\s\S]*?)"\s*(?:,|\})/
-      );
-      const eventType = et?.[1] || "";
-      const responseText = normalizeMarkdown(
-        (rtSingle?.[1] || rtDouble?.[1] || "").trim()
-      );
-      if (responseText) {
-        if (eventType === "sample_confirmation") {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "sample-confirmation",
-          };
-        }
-        if (eventType === "quality_confirmation") {
-          const normalized = responseText.replace(
-            /\bCONTINUE\b/g,
-            "Generate directly"
-          );
-          return {
-            role: "ai",
-            content: normalized,
-            messageType: "quality-confirmation",
-          };
-        }
-        if (eventType === "requirements_feedback") {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-feedback",
-          } as any;
-        }
-        if (eventType === "requirements_sample_offer") {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-sample-offer",
-          } as any;
-        }
-        if (eventType === "testcases_sample_offer") {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "testcases-sample-offer",
-          } as any;
-        }
-        if (eventType === "requirements_sample_offer") {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "requirements-sample-offer",
-          } as any;
-        }
-        if (eventType === "testcases_sample_offer") {
-          return {
-            role: "ai",
-            content: responseText,
-            messageType: "testcases-sample-offer",
-          } as any;
-        }
-        return { role: "ai", content: responseText };
-      }
-      // If no response text is found, suppress showing raw JSON
-      return null;
-    }
-    return {
-      role: "ai",
-      content:
-        typeof raw === "string"
-          ? raw
-          : "```json\n" + JSON.stringify(raw, null, 2) + "\n```",
-    };
-  };
-  const extractToolMeta = (
-    raw: any
-  ): { callId?: string; isRequest?: boolean; isExecution?: boolean } => {
-    const type = raw?.type;
-    const first = Array.isArray(raw?.content) ? raw.content[0] : undefined;
-    if (type === "ToolCallRequestEvent")
-      return { callId: first?.id as string | undefined, isRequest: true };
-    if (type === "ToolCallExecutionEvent")
-      return {
-        callId: first?.call_id as string | undefined,
-        isExecution: true,
-      };
-    return {};
-  };
-  // NOTE: helper inserted above; existing state declarations remain below
-
+ 
   // Initialize with context-aware continuation from suite creation
   useEffect(() => {
     // Load dynamic rows from Supabase for this suite
@@ -1430,124 +651,79 @@ export default function SuiteWorkspace() {
         },
         (payload) => {
           const ev: any = payload.new;
-          let obj: any;
+          let parsed: any;
           try {
-            obj =
-              typeof ev.payload === "string"
-                ? JSON.parse(ev.payload)
-                : ev.payload;
+            parsed = typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload;
           } catch {
-            obj = ev.payload;
+            parsed = ev.payload;
           }
-
-          // Keep a single AI block per user, update it
-          if (obj && obj.source === "user") {
-            const userMsg: Message = {
-              id: ev.message_id,
-              role: "user",
-              content:
-                typeof obj.content === "string"
-                  ? obj.content
-                  : String(obj.content ?? ""),
-              timestamp: new Date(ev.created_at),
-              type: "normal",
-            };
-            const aiMsg: Message = {
-              id: `ai-${ev.message_id}`,
-              role: "ai",
-              content: "",
-              timestamp: new Date(ev.created_at),
-              type: "normal",
-            };
-            (window as any).__aiAgg = { aiId: aiMsg.id, callIndex: {} };
-            setMessages((prev) => [...prev, userMsg, aiMsg]);
-            return;
-          }
-
-          const formatted = formatTeamEvent(obj);
-          if (!formatted) return;
-          const meta = extractToolMeta(obj);
+          const isUser = parsed && parsed.source === "user";
+          const mid = String(ev.message_id);
+          const special = isUser ? null : renderSpecialAiEvent(parsed);
+          const isReqFeedback = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "requirements_feedback");
+          const reqFeedbackText = isReqFeedback ? String(parsed?.response_to_user || parsed?.responseToUser || "") : "";
+          const aiTextMessage = !isUser && String(parsed?.type || "") === "TextMessage" && typeof parsed?.content === "string"
+            ? normalizeMarkdown(String(parsed?.content ?? "")).replace(/\bTERMINATE\b/gi, "").trim()
+            : null;
+          const codeBlock = isUser
+            ? (typeof parsed?.content === "string"
+                ? parsed.content
+                : String(parsed?.content ?? ""))
+            : ((isReqFeedback && reqFeedbackText.trim()) ? reqFeedbackText : (aiTextMessage ?? special ?? (
+                "```json\n" +
+                JSON.stringify(
+                  { payload: parsed, created_at: ev.created_at, message_id: ev.message_id },
+                  null,
+                  2
+                ) +
+                "\n```"
+              )));
 
           setMessages((prev) => {
-            // Find last AI message
-            let idx = -1;
-            for (let i = prev.length - 1; i >= 0; i--) {
-              if (prev[i].role === "ai") {
-                idx = i;
-                break;
-              }
-            }
-            if (idx === -1) {
-              const aiMsg: Message = {
-                id: `ai-${ev.message_id}`,
-                role: "ai",
-                content: "",
-                timestamp: new Date(ev.created_at),
-                type: "normal",
-              };
-              return [...prev, aiMsg];
-            }
+            // Find existing user/ai blocks for this message id
             const next = [...prev];
-            const existing = next[idx];
-            const lines = (existing.content || "")
-              .split("\n\n")
-              .filter(Boolean);
-            const agg = ((window as any).__aiAgg ||= {
-              aiId: existing.id,
-              callIndex: {},
-            });
-            if (agg.aiId !== existing.id) {
-              agg.aiId = existing.id;
-              agg.callIndex = {};
-            }
-
-            const messageType = (formatted as any)?.messageType as
-              | "sample-confirmation"
-              | "quality-confirmation"
-              | "requirements-feedback"
-              | "version-update"
-              | undefined;
-            if (messageType) {
-              if (messageType === "version-update") {
-                // Do not inject raw version into the content lines; only tag the message
-                next[idx] = {
-                  ...existing,
-                  type: messageType,
-                  timestamp: new Date(ev.created_at),
-                  versionNumber: (formatted as any)?.version as
-                    | number
-                    | undefined,
+            const userIdx = next.findIndex((m) => m.id === `user-${mid}`);
+            const aiIdx = next.findIndex((m) => m.id === `ai-${mid}`);
+            if (isUser) {
+              if (userIdx >= 0) {
+                next[userIdx] = {
+                  ...next[userIdx],
+                  content: next[userIdx].content
+                    ? `${next[userIdx].content}\n\n${codeBlock}`
+                    : codeBlock,
                 } as any;
               } else {
-                // Replace block with only the response_to_user
-                next[idx] = {
-                  ...existing,
-                  content: formatted.content,
-                  type: messageType,
+                next.push({
+                  id: `user-${mid}`,
+                  role: "user",
+                  content: codeBlock,
                   timestamp: new Date(ev.created_at),
-                } as any;
+                  type: "normal",
+                });
               }
-              (window as any).__aiAgg = { aiId: existing.id, callIndex: {} };
-              return next;
-            }
-
-            if (meta.isRequest && meta.callId) {
-              lines.push(`⏳ ${formatted.content}`);
-              agg.callIndex[meta.callId] = lines.length - 1;
-            } else if (meta.isExecution && meta.callId) {
-              const li = agg.callIndex[meta.callId];
-              if (typeof li === "number" && lines[li])
-                lines[li] = `✅ ${formatted.content}`;
-              else lines.push(`✅ ${formatted.content}`);
             } else {
-              lines.push(`• ${formatted.content}`);
+              if (aiIdx >= 0) {
+                next[aiIdx] = {
+                  ...next[aiIdx],
+                  content: special === null
+                    ? next[aiIdx].content
+                    : (next[aiIdx].content
+                        ? `${next[aiIdx].content}\n\n${codeBlock}`
+                        : codeBlock),
+                  type: isReqFeedback ? "requirements-feedback" : next[aiIdx].type
+                } as any;
+              } else {
+                if (special !== null) {
+                  next.push({
+                    id: `ai-${mid}`,
+                    role: "ai",
+                    content: codeBlock,
+                    timestamp: new Date(ev.created_at),
+                    type: isReqFeedback ? "requirements-feedback" : "normal",
+                  });
+                }
+              }
             }
-
-            next[idx] = {
-              ...existing,
-              content: lines.join("\n\n"),
-              timestamp: new Date(ev.created_at),
-            } as any;
             return next;
           });
         }
@@ -2333,29 +1509,6 @@ export default function SuiteWorkspace() {
       description: `Exporting ${
         testCases.length
       } test cases in ${format.toUpperCase()} format`,
-    });
-  };
-  const toggleSuiteStatus = () => {
-    if (suiteStatus === "idle" || suiteStatus === "paused") {
-      setSuiteStatus("running");
-      toast({
-        title: "Suite Running",
-        description: "AI test generation is now active",
-      });
-    } else {
-      setSuiteStatus("paused");
-      toast({
-        title: "Suite Paused",
-        description: "AI generation paused - you can resume anytime",
-      });
-    }
-  };
-  const resetSuite = () => {
-    setSuiteStatus("idle");
-    setMessages(messages.slice(0, 1)); // Keep welcome message
-    toast({
-      title: "Suite Reset",
-      description: "Workspace reset to initial state",
     });
   };
 

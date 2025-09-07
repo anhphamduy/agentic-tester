@@ -235,7 +235,6 @@ Documents:
 
         return "Requirements extracted successfully"
 
-
     def generate_and_store_testcases_for_req(
         req_id: Optional[str] = None, style: str = "json"
     ) -> Dict[str, Any]:
@@ -1216,20 +1215,6 @@ Viewpoints (subset):
                 }
             )
 
-        # 5) Record one bulk event (best-effort)
-        _results_writer.write_event(
-            suite_id=suite_id_value,
-            event={
-                "type": "testcases_edited_bulk",
-                "suite_id": suite_id_value,
-                "edits": event_edits,
-                "summary": summary,
-                "version_note": version_note,
-                "user_edit_request": user_edit_request,
-            },
-            message_id=message_id,
-        )
-
         # Suite version already incremented at start of edits
 
         return {
@@ -1734,13 +1719,9 @@ Documents:
             "suite_id": suite_id_value,
         }
 
-        try:
-            _results_writer.write_event(
-                suite_id=suite_id_value, event=event_payload, message_id=message_id
-            )
-        except Exception:
-            # Swallow errors to avoid breaking the flow; termination should still occur
-            pass
+        _results_writer.write_event(
+            suite_id=suite_id_value, event=event_payload, message_id=message_id
+        )
 
         # Include the explicit token so TextMentionTermination triggers
         return {
@@ -2105,14 +2086,34 @@ async def run_stream_with_suite(
         await local_team.load_state(prior_state)
 
     async for event in local_team.run_stream(task=task):
+        print(event)
         _event_payload = json.loads(event.model_dump_json())
         _event_payload.pop("id", None)
         _event_payload.pop("created_at", None)
         _event_payload.pop("metadata", None)
+        _event_payload.pop("models_usage", None)
+        _event_payload.pop("results", None)
+        if type(_event_payload.get("content")) == list:
+            for i in _event_payload["content"]:
+                i.pop("id", None)
+                i.pop("call_id", None)
+
+            if len(_event_payload["content"]) and (
+                _event_payload["content"][0].get("name") == "ask_user"
+                or _event_payload["content"][0].get("name") == "generate_preview"
+            ):
+                continue
+        for i in _event_payload.get("tool_calls", []):
+            i.pop("id", None)
         inserted_message_id = (
-            _message_id if _event_payload.get("source") == "user" else user_message_id
+            user_message_id if _event_payload.get("source") == "user" else _message_id
         )
-        if not _event_payload.get("messages"):
+        if (
+            not _event_payload.get("messages")
+            and not _event_payload.get("type") == "ToolCallSummaryMessage"
+            and not _event_payload.get("type") == "HandoffMessage"
+        ):
+            print(_event_payload)
             _results_writer.write_event(
                 suite_id=suite_id, event=_event_payload, message_id=inserted_message_id
             )
