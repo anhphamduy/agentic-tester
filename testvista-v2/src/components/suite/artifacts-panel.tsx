@@ -262,14 +262,16 @@ export function ArtifactsPanel({
       contentObjects.forEach((obj) =>
         Object.keys(obj || {}).forEach((k) => keySet.add(k))
       );
-      const allKeys = Array.from(keySet);
+      const allKeys = Array.from(keySet).filter(
+        (k) => !["version", "requirement_id", "requirementId", "reqIds", "req_ids"].includes(k)
+      );
       const orderedKeys = [
         ...preferredOrder.filter((k) => allKeys.includes(k)),
         ...allKeys.filter((k) => !preferredOrder.includes(k)),
       ];
 
       return (
-        <Table>
+        <Table className="table-fixed w-full">
           <TableHeader className="sticky top-0 bg-muted/50 z-10">
             <TableRow>
               {orderedKeys.map((k) => (
@@ -283,7 +285,7 @@ export function ArtifactsPanel({
             {contentObjects.map((obj, idx) => (
               <TableRow key={idx}>
                 {orderedKeys.map((k) => (
-                  <TableCell key={k} className="text-xs align-top">
+                  <TableCell key={k} className={`text-xs align-top break-words ${k === "steps" ? "whitespace-pre-wrap max-w-[600px]" : ""}`}>
                     {stringify(obj?.[k])}
                   </TableCell>
                 ))}
@@ -297,14 +299,16 @@ export function ArtifactsPanel({
     // Default: show all top-level fields across rows as columns
     const keySet = new Set<string>();
     rows.forEach((r) => Object.keys(r || {}).forEach((k) => keySet.add(k)));
-    const allKeys = Array.from(keySet);
+    const allKeys = Array.from(keySet).filter(
+      (k) => !["version", "requirement_id", "requirementId", "reqIds", "req_ids"].includes(k)
+    );
     const orderedKeys = [
       ...preferredOrder.filter((k) => allKeys.includes(k)),
       ...allKeys.filter((k) => !preferredOrder.includes(k)),
     ];
 
     return (
-      <Table>
+      <Table className="table-fixed w-full">
         <TableHeader className="sticky top-0 bg-muted/50 z-10">
           <TableRow>
             {orderedKeys.map((k) => (
@@ -318,7 +322,7 @@ export function ArtifactsPanel({
           {rows.map((row, idx) => (
             <TableRow key={row?.id || idx}>
               {orderedKeys.map((k) => (
-                <TableCell key={k} className="text-xs align-top">
+                <TableCell key={k} className={`text-xs align-top break-words ${k === "steps" ? "whitespace-pre-wrap max-w-[600px]" : ""}`}>
                   {stringify(row?.[k])}
                 </TableCell>
               ))}
@@ -603,7 +607,7 @@ export function ArtifactsPanel({
                       chat to get started.
                     </div>
                   ) : (
-                    <Table>
+                    <Table className="table-fixed w-full">
                       <TableHeader className="sticky top-0 bg-muted/50 z-10">
                         <TableRow>
                           <TableHead className={isFullScreen ? "w-24" : "w-20"}>
@@ -775,7 +779,7 @@ export function ArtifactsPanel({
               <CardContent className="p-0 flex-1 min-h-0">
                 <div className="flex-1 h-full overflow-hidden border border-border/50 rounded-md">
                   <div className="h-full overflow-auto">
-                    {renderDynamicTable(dynamicTestViewpointRows, ["id", "test_design_id", "requirement_id", "name", "rationale", "content", "created_at"]) || (
+                    {renderDynamicTable(dynamicTestViewpointRows, ["id", "test_design_id", "requirement_id", "name", "content", "created_at"]) || (
                       <div className="p-6 text-center text-sm text-muted-foreground">No test viewpoints available.</div>
                     )}
                   </div>
@@ -810,7 +814,7 @@ export function ArtifactsPanel({
                       chat.
                     </div>
                   ) : (
-                    <Table>
+                    <Table className="table-fixed w-full">
                       <TableHeader className="sticky top-0 bg-muted/50 z-10">
                         <TableRow>
                           <TableHead className={isFullScreen ? "w-24" : "w-20"}>
@@ -954,6 +958,7 @@ export function ArtifactsPanel({
                       "steps",
                       "expected_result",
                       "severity",
+                      "links",
                     ])
                   ) : testCases.length === 0 ? (
                     <div className="p-6 text-center text-sm text-muted-foreground">
@@ -961,7 +966,7 @@ export function ArtifactsPanel({
                       chat.
                     </div>
                   ) : (
-                    <Table>
+                    <Table className="table-fixed w-full">
                       <TableHeader className="sticky top-0 bg-muted/50 z-10">
                         <TableRow>
                           <TableHead className="w-12 min-w-12"></TableHead>
@@ -976,6 +981,9 @@ export function ArtifactsPanel({
                           </TableHead>
                           <TableHead className="hidden lg:table-cell min-w-32">
                             Expected Result
+                          </TableHead>
+                          <TableHead className="hidden lg:table-cell min-w-40">
+                            Links
                           </TableHead>
                           <TableHead className="w-16 min-w-16 sm:w-20">
                             Severity
@@ -1031,7 +1039,7 @@ export function ArtifactsPanel({
                               {tc.id}
                             </TableCell>
                             <TableCell
-                              className={isFullScreen ? "max-w-[320px]" : ""}
+                              className={`${isFullScreen ? "max-w-[320px]" : ""} break-words`}
                             >
                               <EditableCell
                                 value={tc.title}
@@ -1042,7 +1050,7 @@ export function ArtifactsPanel({
                                 multiline
                               />
                             </TableCell>
-                            <TableCell className="hidden md:table-cell">
+                            <TableCell className="hidden md:table-cell whitespace-pre-wrap break-words max-w-[600px]">
                               <EditableCell
                                 value={tc.steps}
                                 cellId={`tc-${tc.id}-steps`}
@@ -1052,7 +1060,7 @@ export function ArtifactsPanel({
                                 multiline
                               />
                             </TableCell>
-                            <TableCell className="hidden lg:table-cell">
+                            <TableCell className="hidden lg:table-cell whitespace-pre-wrap break-words max-w-[480px]">
                               <EditableCell
                                 value={tc.expectedResult}
                                 cellId={`tc-${tc.id}-result`}
@@ -1061,6 +1069,9 @@ export function ArtifactsPanel({
                                 field="expectedResult"
                                 multiline
                               />
+                            </TableCell>
+                            <TableCell className="hidden lg:table-cell whitespace-pre-wrap break-words max-w-[360px]">
+                              {(tc as any)?.links || ""}
                             </TableCell>
                             <TableCell>
                               <Badge className={getPriorityColor(tc.severity)}>

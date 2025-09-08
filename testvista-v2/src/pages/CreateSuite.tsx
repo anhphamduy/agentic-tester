@@ -235,7 +235,6 @@ export default function CreateSuite() {
   const handleChatSubmit = async () => {
     if (!chatInput.trim()) return;
     setIsCreating(true);
-    console.log("Creating suite:", chatInput);
     try {
       const apiBase =
         (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:8000";

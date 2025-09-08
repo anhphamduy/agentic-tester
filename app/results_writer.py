@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from supabase import Client, create_client
 
@@ -23,6 +24,18 @@ class ResultsWriter:
         req_code: str,
         testcases: Dict[str, Any],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> None:
+        raise NotImplementedError
+
+    # Bulk: persist multiple testcases rows at once
+    def write_testcases_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        rows: List[Dict[str, Any]],
         version: Optional[int] = None,
         active: bool = True,
     ) -> None:
@@ -71,15 +84,40 @@ class ResultsWriter:
     ) -> Optional[str]:
         raise NotImplementedError
 
+    # Bulk: persist multiple test_design rows at once
+    def write_test_design_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        items: List[Dict[str, Any]],
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> List[str]:
+        raise NotImplementedError
+
     # New: persist per-requirement viewpoints linked to test_design and requirement
     def write_viewpoints(
         self,
         *,
         session_id: str,
         suite_id: Optional[str],
+        requirement_id: Optional[str] = None,
         content: Dict[str, Any],
         test_design_id: Optional[str],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> List[str]:
+        raise NotImplementedError
+
+    # Bulk: persist multiple viewpoints groups/items at once
+    def write_viewpoints_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        items: List[Dict[str, Any]],
         version: Optional[int] = None,
         active: bool = True,
     ) -> List[str]:
@@ -105,6 +143,17 @@ class NoopResultsWriter(ResultsWriter):
         req_code: str,
         testcases: Dict[str, Any],
         suite_id: Optional[str] = None,
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> None:
+        return None
+
+    def write_testcases_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        rows: List[Dict[str, Any]],
         version: Optional[int] = None,
         active: bool = True,
     ) -> None:
@@ -146,14 +195,37 @@ class NoopResultsWriter(ResultsWriter):
     ) -> Optional[str]:
         return None
 
+    def write_test_design_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        items: List[Dict[str, Any]],
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> List[str]:
+        return []
+
     def write_viewpoints(
         self,
         *,
         session_id: str,
         suite_id: Optional[str],
+        requirement_id: Optional[str] = None,
         content: Dict[str, Any],
         test_design_id: Optional[str],
         testing_type: str = "integration",
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> List[str]:
+        return []
+
+    def write_viewpoints_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        items: List[Dict[str, Any]],
         version: Optional[int] = None,
         active: bool = True,
     ) -> List[str]:
@@ -281,6 +353,46 @@ class SupabaseResultsWriter(ResultsWriter):
                 "active": bool(active),
             }
         ).execute()
+    def write_testcases_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        rows: List[Dict[str, Any]],
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> None:
+        # rows: [{ req_code: str, testcases: dict, version?: int }]
+        if not rows:
+            return None
+        max_workers = min(8, max(1, len(rows)))
+        def _task(row: Dict[str, Any]) -> None:
+            try:
+                req_code_local = str(row.get("req_code") or "").strip()
+                if not req_code_local:
+                    return None
+                tc_local = row.get("testcases") or {}
+                ver_local = (
+                    row.get("version") if row.get("version") is not None else version
+                )
+                self.write_testcases(
+                    session_id=session_id,
+                    req_code=req_code_local,
+                    testcases=tc_local,
+                    suite_id=suite_id,
+                    version=ver_local,  # type: ignore[arg-type]
+                    active=active,
+                )
+            except Exception:
+                return None
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_task, r) for r in rows]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
 
     def write_event(
         self,
@@ -372,11 +484,53 @@ class SupabaseResultsWriter(ResultsWriter):
         except Exception:
             return None
 
+    def write_test_design_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        items: List[Dict[str, Any]],
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> List[str]:
+        inserted_ids: List[str] = []
+        if not items:
+            return inserted_ids
+        max_workers = min(8, max(1, len(items)))
+        def _task(item: Dict[str, Any]) -> Optional[str]:
+            try:
+                content_local = item.get("content") or {}
+                ttype_local = str(item.get("testing_type") or "integration")
+                ver_local = (
+                    item.get("version") if item.get("version") is not None else version
+                )
+                return self.write_test_design(
+                    session_id=session_id,
+                    suite_id=suite_id,
+                    content=content_local,
+                    testing_type=ttype_local,
+                    version=ver_local,  # type: ignore[arg-type]
+                    active=active,
+                )
+            except Exception:
+                return None
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_task, it) for it in items]
+            for f in as_completed(futures):
+                try:
+                    rid = f.result()
+                    if rid:
+                        inserted_ids.append(rid)
+                except Exception:
+                    pass
+        return inserted_ids
+
     def write_viewpoints(
         self,
         *,
         session_id: str,
         suite_id: Optional[str],
+        requirement_id: Optional[str] = None,
         content: Dict[str, Any],
         test_design_id: Optional[str],
         testing_type: str = "integration",
@@ -384,42 +538,133 @@ class SupabaseResultsWriter(ResultsWriter):
         active: bool = True,
     ) -> List[str]:
         inserted_ids: List[str] = []
-        vp_groups = content.get("viewpoints") if isinstance(content, dict) else None
-        if not isinstance(vp_groups, list):
-            return inserted_ids
-        for group in vp_groups:
-            if not isinstance(group, dict):
-                continue
-            req_code = group.get("req_code")
-            items = group.get("items") if isinstance(group.get("items"), list) else []
-            requirement_id = None
-            if req_code:
-                requirement_id = self._get_requirement_row_id(
-                    suite_id=suite_id, req_code=str(req_code)
-                )
-            for it in items:
-                if not isinstance(it, dict):
+
+        def _resolve_requirement_id_from_item(item: Dict[str, Any]) -> Optional[str]:
+            try:
+                refs = item.get("references") or {}
+                reqs = refs.get("requirements") if isinstance(refs, dict) else None
+                first_code = None
+                if isinstance(reqs, list) and reqs:
+                    first_code = reqs[0]
+                if first_code:
+                    return self._get_requirement_row_id(
+                        suite_id=suite_id, req_code=str(first_code)
+                    )
+            except Exception:
+                return None
+            return None
+
+        # Normalize "content" to an iterable of items with an optional req_code
+        items_to_write: List[Dict[str, Any]] = []
+        if isinstance(content, dict) and isinstance(content.get("viewpoints"), list):
+            # Original grouped format
+            for group in content.get("viewpoints"):
+                if not isinstance(group, dict):
                     continue
-                # Deactivate prior active with same natural key (suite, requirement, name)
+                req_code_group = group.get("req_code")
+                items = group.get("items") if isinstance(group.get("items"), list) else []
+                for it in items:
+                    if isinstance(it, dict):
+                        it_copy = dict(it)
+                        if req_code_group is not None:
+                            it_copy["__req_code"] = req_code_group
+                        items_to_write.append(it_copy)
+        elif isinstance(content, dict) and isinstance(content.get("items"), list):
+            # Single group with items, possibly with req_code
+            req_code_group = content.get("req_code")
+            for it in content.get("items"):
+                if isinstance(it, dict):
+                    it_copy = dict(it)
+                    if req_code_group is not None:
+                        it_copy["__req_code"] = req_code_group
+                    items_to_write.append(it_copy)
+        elif isinstance(content, list):
+            # Already a list of items
+            for it in content:
+                if isinstance(it, dict):
+                    items_to_write.append(dict(it))
+        elif isinstance(content, dict):
+            # Single item
+            items_to_write.append(dict(content))
+
+        for it in items_to_write:
+            if not isinstance(it, dict):
+                continue
+            # Determine requirement_id: prefer explicit __req_code; else derive from references
+            requirement_id_local: Optional[str] = requirement_id
+            req_code_hint = it.pop("__req_code", None)
+            if requirement_id_local is None and req_code_hint is not None:
                 try:
-                    self._client.table("viewpoints").update({"active": False}).eq("suite_id", suite_id).eq("requirement_id", requirement_id).eq("name", it.get("name")).eq("active", True).execute()
+                    requirement_id_local = self._get_requirement_row_id(
+                        suite_id=suite_id, req_code=str(req_code_hint)
+                    )
                 except Exception:
-                    pass
-                row = {
-                    "suite_id": suite_id,
-                    "test_design_id": test_design_id,
-                    "requirement_id": requirement_id,
-                    "name": it.get("name"),
-                    "rationale": it.get("rationale"),
-                    "content": it,
-                    "version": version,
-                    "active": bool(active),
-                }
-                res = self._client.table("viewpoints").insert(row).execute()
-                try:
-                    rid = ((res.data or [])[0] or {}).get("id")
-                    if rid:
-                        inserted_ids.append(rid)
-                except Exception:
-                    pass
+                    requirement_id_local = None
+            if requirement_id_local is None:
+                requirement_id_local = _resolve_requirement_id_from_item(it)
+
+            # Deactivate prior active with same natural key (suite, requirement, name)
+            try:
+                self._client.table("viewpoints").update({"active": False}).eq("suite_id", suite_id).eq("requirement_id", requirement_id_local).eq("name", it.get("name")).eq("active", True).execute()
+            except Exception:
+                pass
+            row = {
+                "suite_id": suite_id,
+                "test_design_id": test_design_id,
+                "requirement_id": requirement_id_local,
+                "name": it.get("name"),
+                "content": it,
+                "version": version,
+                "active": bool(active),
+            }
+            res = self._client.table("viewpoints").insert(row).execute()
+            try:
+                rid = ((res.data or [])[0] or {}).get("id")
+                if rid:
+                    inserted_ids.append(rid)
+            except Exception:
+                pass
         return inserted_ids
+
+    def write_viewpoints_bulk(
+        self,
+        *,
+        session_id: str,
+        suite_id: Optional[str],
+        items: List[Dict[str, Any]],
+        version: Optional[int] = None,
+        active: bool = True,
+    ) -> List[str]:
+        # items: [{ content: dict, test_design_id?: str, version?: int }]
+        all_inserted: List[str] = []
+        if not items:
+            return all_inserted
+        max_workers = min(8, max(1, len(items)))
+        def _task(item: Dict[str, Any]) -> List[str]:
+            try:
+                content_local = item.get("content") or {}
+                tdesign_local = item.get("test_design_id")
+                requirement_id_local = item.get("requirement_id")
+                ver_local = (
+                    item.get("version") if item.get("version") is not None else version
+                )
+                return self.write_viewpoints(
+                    session_id=session_id,
+                    suite_id=suite_id,
+                    requirement_id=requirement_id_local,
+                    content=content_local,
+                    test_design_id=tdesign_local,
+                    version=ver_local,  # type: ignore[arg-type]
+                    active=active,
+                )
+            except Exception:
+                return []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_task, it) for it in items]
+            for f in as_completed(futures):
+                try:
+                    inserted = f.result() or []
+                    all_inserted.extend(inserted)
+                except Exception:
+                    pass
+        return all_inserted

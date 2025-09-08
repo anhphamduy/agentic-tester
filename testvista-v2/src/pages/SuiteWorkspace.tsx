@@ -146,6 +146,10 @@ export default function SuiteWorkspace() {
   >("requirements");
   const [initialChatLoading, setInitialChatLoading] = useState(true);
   const hasLoadedChatOnce = useRef(false);
+  // Track latest suite version from test_suites.state
+  const [latestSuiteVersion, setLatestSuiteVersion] = useState<
+    number | undefined
+  >(undefined);
   const loadTeamEvents = async () => {
     try {
       if (!hasLoadedChatOnce.current) setInitialChatLoading(true);
@@ -163,9 +167,6 @@ export default function SuiteWorkspace() {
         .select("payload, created_at, message_id")
         .eq("suite_id", suiteIdVal)
         .order("created_at", { ascending: true });
-      console.log(data)
-      console.log(JSON.stringify(data, null, 2))
-
         if (error) throw error;
       const grouped: Record<string, { createdAt: string; user: string[]; ai: string[]; aiType?: Message["type"] }> = {};
       (data || []).forEach((ev: any) => {
@@ -240,7 +241,26 @@ export default function SuiteWorkspace() {
           return msgs;
         });
 
-      setMessages(result);
+      setMessages((prev) => {
+        const serverMessages = result;
+        const localUserMessages = prev.filter(
+          (m) => m.role === "user" && String(m.id || "").startsWith("local-")
+        );
+        const merged = [...serverMessages];
+        localUserMessages.forEach((lm) => {
+          const exists = serverMessages.some(
+            (sm) =>
+              sm.role === "user" &&
+              normalizeMarkdown(sm.content || "").trim() ===
+                normalizeMarkdown(lm.content || "").trim()
+          );
+          if (!exists) merged.push(lm);
+        });
+        return merged.sort(
+          (a, b) =>
+            (a.timestamp?.getTime?.() || 0) - (b.timestamp?.getTime?.() || 0)
+        );
+      });
       setInitialChatLoading(false);
       hasLoadedChatOnce.current = true;
     } catch (e) {
@@ -447,6 +467,45 @@ export default function SuiteWorkspace() {
         return details || "Gap analysis completed.";
       }
 
+      // Planner: restore_suite_version request/result
+      if (type === "ToolCallRequestEvent" && source === "planner" && name === "restore_suite_version") {
+        try {
+          const args = first?.arguments ? JSON.parse(first.arguments) : {};
+          const sv = args?.source_version;
+          const svNum = typeof sv === "number" ? sv : parseInt(String(sv ?? ""), 10);
+          const verText = Number.isFinite(svNum) ? ` version ${svNum}` : " a chosen version";
+          return `⏳ Restoring from${verText}...`;
+        } catch {
+          return "⏳ Restoring from selected version...";
+        }
+      }
+      if (type === "ToolCallExecutionEvent" && source === "planner" && name === "restore_suite_version") {
+        try {
+          let bodyRaw = String(first?.content ?? "");
+          let parsed: any;
+          try {
+            parsed = JSON.parse(bodyRaw);
+          } catch {
+            const normalized = bodyRaw
+              .replace(/'/g, '"')
+              .replace(/\bNone\b/g, 'null')
+              .replace(/\bTrue\b/g, 'true')
+              .replace(/\bFalse\b/g, 'false');
+            parsed = JSON.parse(normalized);
+          }
+          const nv = parsed?.new_version;
+          const rf = parsed?.restored_from;
+          const nvNum = typeof nv === "number" ? nv : parseInt(String(nv ?? ""), 10);
+          const rfNum = typeof rf === "number" ? rf : parseInt(String(rf ?? ""), 10);
+          if (Number.isFinite(nvNum) && Number.isFinite(rfNum)) {
+            return `✅ Restored to version ${nvNum} (from v${rfNum}).`;
+          }
+          return "✅ Restore completed.";
+        } catch {
+          return "✅ Restore completed.";
+        }
+      }
+
       // Planner: list/get test case information (concise)
       if (type === "ToolCallRequestEvent" && source === "planner" && name === "get_testcases_info") {
         return "⏳ I'm retrieving test case information...";
@@ -528,9 +587,57 @@ export default function SuiteWorkspace() {
           out.push({
             id: caseId,
             title: stringifyCompact(c?.title),
-            steps: stringifyCompact(c?.steps),
+            steps: (() => {
+              try {
+                const s = c?.steps;
+                if (Array.isArray(s)) return s.map((x: any) => String(x)).join("\n");
+                if (typeof s === "string") {
+                  console.log(s)
+
+                  // Normalize any escaped newlines and convert common list separators to newlines
+                  return String(s)
+                    .replace(/\\r\\n/g, "\n")
+                    .replace(/\\n/g, "\n")
+                    .replace(/\s*;\s*/g, "\n");
+                }
+                return stringifyCompact(s);
+              } catch {
+                return stringifyCompact(c?.steps);
+              }
+            })(),
             expected_result: stringifyCompact(c?.expected),
             severity: stringifyCompact(c?.type),
+            links: (() => {
+              try {
+                const caseLinks = (c as any)?.links;
+                const fromCase = Array.isArray(caseLinks?.flows) ? caseLinks.flows : [];
+                const fromTop = Array.isArray((content as any)?.linked_flows)
+                  ? (content as any).linked_flows
+                  : [];
+                const merged = [...fromCase, ...fromTop].map((x: any) => String(x));
+                // de-duplicate while preserving order
+                const seen = new Set<string>();
+                const unique = merged.filter((v) => (seen.has(v) ? false : (seen.add(v), true)));
+                const flowsStr = unique.join(", ");
+
+                const vpFromCase = Array.isArray(caseLinks?.viewpoints) ? caseLinks.viewpoints : [];
+                const vpFromTop = Array.isArray((content as any)?.linked_viewpoints)
+                  ? (content as any).linked_viewpoints
+                  : [];
+                const vpMerged = [...vpFromCase, ...vpFromTop].map((x: any) => String(x));
+                const vpSeen = new Set<string>();
+                const vpUnique = vpMerged.filter((v) => (vpSeen.has(v) ? false : (vpSeen.add(v), true)));
+                const vpsStr = vpUnique.join(", ");
+
+                const parts: string[] = [];
+                if (reqId) parts.push(`Requirement: ${reqId}`);
+                if (flowsStr) parts.push(`Flows: ${flowsStr}`);
+                if (vpsStr) parts.push(`Viewpoints: ${vpsStr}`);
+                return parts.join("\n");
+              } catch {
+                return "";
+              }
+            })(),
             requirement_id: reqId,
             version,
           });
@@ -591,45 +698,58 @@ export default function SuiteWorkspace() {
  
   // Initialize with context-aware continuation from suite creation
   useEffect(() => {
-    // Load dynamic rows from Supabase for this suite
-    const loadDynamic = async () => {
+    void loadTeamEvents();
+  }, []);
+
+  // Load artifacts strictly for the latest suite version
+  useEffect(() => {
+    const loadDynamicForVersion = async () => {
       try {
         setLoadingStates({ requirements: true, testCases: true });
         const suiteIdParam = new URLSearchParams(window.location.search).get(
           "suiteId"
         );
         const suiteIdVal = id || suiteIdParam || undefined;
-        if (!suiteIdVal) return;
+        if (!suiteIdVal || latestSuiteVersion == null) return;
+        const version = latestSuiteVersion;
         const [{ data: reqs }, { data: tcs }, { data: tds }, { data: tvps }] =
           await Promise.all([
             supabase
               .from("requirements")
               .select("*")
-              .eq("suite_id", suiteIdVal),
-            supabase.from("test_cases").select("*").eq("suite_id", suiteIdVal),
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version),
+            supabase
+              .from("test_cases")
+              .select("*")
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version),
             supabase
               .from("test_designs")
               .select("*")
-              .eq("suite_id", suiteIdVal),
-            supabase.from("viewpoints").select("*").eq("suite_id", suiteIdVal),
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version),
+            supabase
+              .from("viewpoints")
+              .select("*")
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version),
           ]);
         setDynamicRequirementsRows(sortRequirementsByReqCode(reqs || []));
         {
           const flattened = flattenTestCaseRows(tcs || []);
-          const latestOnly = filterLatestTestcasesByRequirement(flattened);
-          setDynamicTestCaseRows(sortTestCasesByReqThenId(latestOnly));
+          setDynamicTestCaseRows(sortTestCasesByReqThenId(flattened));
         }
         setDynamicTestDesignRows(tds || []);
         setDynamicTestViewpointRows(tvps || []);
       } catch (e) {
-        console.error("Failed to fetch dynamic artifacts", e);
+        console.error("Failed to fetch dynamic artifacts for version", e);
       } finally {
         setLoadingStates({});
       }
     };
-    void loadDynamic();
-    void loadTeamEvents();
-  }, []);
+    void loadDynamicForVersion();
+  }, [id, latestSuiteVersion]);
 
   // Realtime subscription to team_events for this suite
   useEffect(() => {
@@ -660,6 +780,42 @@ export default function SuiteWorkspace() {
           const isUser = parsed && parsed.source === "user";
           const mid = String(ev.message_id);
           const special = isUser ? null : renderSpecialAiEvent(parsed);
+          // If a restore succeeded, force-refresh latest version scoped artifacts
+          try {
+            if (
+              !isUser &&
+              parsed?.type === "ToolCallExecutionEvent" &&
+              Array.isArray(parsed?.content) &&
+              parsed?.content[0]?.name === "restore_suite_version" &&
+              parsed?.content[0]?.is_error === false
+            ) {
+              // Reload status to get updated latest version, then reload artifacts
+              setTimeout(() => {
+                try {
+                  // trigger status effect by re-setting id deps indirectly
+                  const suiteIdParam2 = new URLSearchParams(window.location.search).get("suiteId");
+                  const suiteIdVal2 = id || suiteIdParam2 || undefined;
+                  if (!suiteIdVal2) return;
+                  // quick status poll
+                  supabase
+                    .from("test_suites")
+                    .select("status, state")
+                    .eq("id", suiteIdVal2)
+                    .maybeSingle()
+                    .then(({ data }) => {
+                      try {
+                        const st2: any = (data as any)?.state;
+                        const raw2 = st2?.agent_state?.latest_version ?? st2?.latest_version ?? st2?.agent_state?.latest_testcases_version ?? st2?.latest_testcases_version;
+                        const parsed2 = typeof raw2 === "number" ? raw2 : parseInt(String(raw2 ?? ""), 10);
+                        if (!Number.isNaN(parsed2)) {
+                          setLatestSuiteVersion(parsed2);
+                        }
+                      } catch {}
+                    });
+                } catch {}
+              }, 100);
+            }
+          } catch {}
           const isReqFeedback = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "requirements_feedback");
           const reqFeedbackText = isReqFeedback ? String(parsed?.response_to_user || parsed?.responseToUser || "") : "";
           const aiTextMessage = !isUser && String(parsed?.type || "") === "TextMessage" && typeof parsed?.content === "string"
@@ -685,7 +841,23 @@ export default function SuiteWorkspace() {
             const userIdx = next.findIndex((m) => m.id === `user-${mid}`);
             const aiIdx = next.findIndex((m) => m.id === `ai-${mid}`);
             if (isUser) {
-              if (userIdx >= 0) {
+              // Replace matching local optimistic user message if present
+              const localIdx = next.findIndex(
+                (m) =>
+                  m.role === "user" &&
+                  String(m.id || "").startsWith("local-") &&
+                  normalizeMarkdown(m.content || "").trim() ===
+                    normalizeMarkdown(codeBlock || "").trim()
+              );
+              if (localIdx >= 0) {
+                next[localIdx] = {
+                  id: `user-${mid}`,
+                  role: "user",
+                  content: codeBlock,
+                  timestamp: new Date(ev.created_at),
+                  type: "normal",
+                } as any;
+              } else if (userIdx >= 0) {
                 next[userIdx] = {
                   ...next[userIdx],
                   content: next[userIdx].content
@@ -743,7 +915,8 @@ export default function SuiteWorkspace() {
       "suiteId"
     );
     const suiteIdVal = id || suiteIdParam || undefined;
-    if (!suiteIdVal) return;
+    if (!suiteIdVal || latestSuiteVersion == null) return;
+    const version = latestSuiteVersion;
 
     const channel = supabase
       .channel(`artifacts:${suiteIdVal}`)
@@ -760,7 +933,8 @@ export default function SuiteWorkspace() {
             const { data } = await supabase
               .from("requirements")
               .select("*")
-              .eq("suite_id", suiteIdVal);
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version);
             setDynamicRequirementsRows(sortRequirementsByReqCode(data || []));
             // Jump to requirements tab on any realtime change
             setActiveArtifactsTab("requirements");
@@ -782,11 +956,11 @@ export default function SuiteWorkspace() {
             const { data } = await supabase
               .from("test_cases")
               .select("*")
-              .eq("suite_id", suiteIdVal);
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version);
             {
               const flattened = flattenTestCaseRows(data || []);
-              const latestOnly = filterLatestTestcasesByRequirement(flattened);
-              setDynamicTestCaseRows(sortTestCasesByReqThenId(latestOnly));
+              setDynamicTestCaseRows(sortTestCasesByReqThenId(flattened));
             }
             // Jump to test cases tab on any realtime change
             setActiveArtifactsTab("testcases");
@@ -808,7 +982,8 @@ export default function SuiteWorkspace() {
             const { data } = await supabase
               .from("test_designs")
               .select("*")
-              .eq("suite_id", suiteIdVal);
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version);
             setDynamicTestDesignRows(data || []);
           } catch (e) {
             console.error("Failed to refresh test designs (realtime)", e);
@@ -828,7 +1003,8 @@ export default function SuiteWorkspace() {
             const { data } = await supabase
               .from("viewpoints")
               .select("*")
-              .eq("suite_id", suiteIdVal);
+              .eq("suite_id", suiteIdVal)
+              .eq("version", version);
             setDynamicTestViewpointRows(data || []);
           } catch (e) {
             console.error("Failed to refresh viewpoints (realtime)", e);
@@ -842,12 +1018,8 @@ export default function SuiteWorkspace() {
         supabase.removeChannel(channel);
       } catch {}
     };
-  }, [id]);
+  }, [id, latestSuiteVersion]);
 
-  // Track latest test case version from test_suites.state
-  const [latestTestcasesVersion, setLatestTestcasesVersion] = useState<
-    number | undefined
-  >(undefined);
   // Listen to suite status (chatting/idle) from 'test_suites' table and set spinner
   useEffect(() => {
     const suiteIdParam = new URLSearchParams(window.location.search).get(
@@ -867,6 +1039,8 @@ export default function SuiteWorkspace() {
         setAgentLoading(status === "chatting" || status === "running");
         const st = (data as any)?.state as any;
         const rawLatest =
+          st?.agent_state?.latest_version ??
+          st?.latest_version ??
           st?.agent_state?.latest_testcases_version ??
           st?.latest_testcases_version;
         const parsed =
@@ -874,7 +1048,7 @@ export default function SuiteWorkspace() {
             ? rawLatest
             : parseInt(String(rawLatest ?? ""), 10);
         if (!Number.isNaN(parsed)) {
-          setLatestTestcasesVersion(parsed);
+          setLatestSuiteVersion(parsed);
         }
       } catch {}
     };
@@ -898,6 +1072,8 @@ export default function SuiteWorkspace() {
           try {
             const st = (payload.new as any)?.state as any;
             const rawLatest =
+              st?.agent_state?.latest_version ??
+              st?.latest_version ??
               st?.agent_state?.latest_testcases_version ??
               st?.latest_testcases_version;
             const parsed =
@@ -905,7 +1081,7 @@ export default function SuiteWorkspace() {
                 ? rawLatest
                 : parseInt(String(rawLatest ?? ""), 10);
             if (!Number.isNaN(parsed)) {
-              setLatestTestcasesVersion(parsed);
+              setLatestSuiteVersion(parsed);
             }
           } catch {}
         }
@@ -919,7 +1095,6 @@ export default function SuiteWorkspace() {
     };
   }, [id]);
 
-  console.log(agentLoading);
 
   const handleGenerateArtifacts = async (requirementId: string) => {
     const requirement = requirements.find((req) => req.id === requirementId);
@@ -1043,20 +1218,20 @@ export default function SuiteWorkspace() {
     message: string,
     opts?: { silent?: boolean }
   ) => {
+    const baseId = Date.now().toString();
+    const type = message.startsWith("/") ? "command" : "normal";
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: type === "normal" ? `local-${baseId}` : baseId,
       role: "user",
       content: message,
       timestamp: new Date(),
-      type: message.startsWith("/") ? "command" : "normal",
+      type,
     };
-    // Avoid double user messages: for normal chat we rely on realtime team_events
-    // Only append locally for commands or when explicitly not silent
-    if (!opts?.silent && userMessage.type !== "normal") {
+    // Optimistically append user message for better UX
+    if (!opts?.silent) {
       setMessages((prev) => [...prev, userMessage]);
     }
     setIsLoading(true);
-    console.log("Sending message:", message);
     // If this is a normal chat message, stream from backend API
     if (userMessage.type === "normal") {
       try {
@@ -1107,7 +1282,7 @@ export default function SuiteWorkspace() {
         });
       } finally {
         setIsLoading(false);
-        // Always reload from team_events to avoid duplicate locally injected messages
+        // Reload from team_events, preserving any still-pending local messages
         void loadTeamEvents();
       }
       return;
@@ -1280,17 +1455,11 @@ export default function SuiteWorkspace() {
           lowerMessage.includes("requirements"))
       ) {
         command = "/viewpoints"; // Treat as viewpoints generation
-        console.log(
-          "🎯 Matched artifact generation pattern, command set to:",
-          command
-        );
       }
 
       if (command && hasModifiedArtifacts) {
-        console.log("🚀 Creating auto-save version with command:", command);
         const currentArtifacts = { requirements, viewpoints, testCases };
         versionInfo = versionManager.autoSaveVersion(currentArtifacts, command);
-        console.log("📦 Version created:", versionInfo);
       }
 
       // Check if AI response needs implementation permission
@@ -1531,6 +1700,10 @@ export default function SuiteWorkspace() {
           title: "Version Restored",
           description: `Successfully restored to version ${version.versionNumber}`,
         });
+        // Also instruct backend planner to restore the suite version server-side
+        // so DB artifacts are cloned into a new version.
+        const msg = `Please restore suite to version ${version.versionNumber}.`;
+        void handleSendMessage(msg);
       }
     }
   };
@@ -1652,7 +1825,7 @@ export default function SuiteWorkspace() {
             onVersionAction={handleVersionAction}
             onViewHistory={() => setShowVersionHistory(true)}
             uploadedFiles={uploadedFiles}
-            latestTestcasesVersion={latestTestcasesVersion}
+            latestTestcasesVersion={latestSuiteVersion}
           />
           {initialChatLoading && (
             <div className="absolute inset-0 flex items-center justify-center bg-background/70 z-10">

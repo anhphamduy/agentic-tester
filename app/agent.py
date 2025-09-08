@@ -96,14 +96,14 @@ def make_team_for_suite(
         """
         try:
             prior_state = _get_suite_agent_state(suite_id_value) or {}
-            prior_val = prior_state.get("latest_testcases_version")
+            prior_val = prior_state.get("latest_version")
             try:
                 prior_int = int(prior_val) if prior_val is not None else None
             except Exception:
                 prior_int = None
             if prior_int is None or int(new_version) > prior_int:
                 merged_state = dict(prior_state)
-                merged_state["latest_testcases_version"] = int(new_version)
+                merged_state["latest_version"] = int(new_version)
                 _write_full_suite_state(
                     suite_id=suite_id_value,
                     agent_state=merged_state,
@@ -112,25 +112,27 @@ def make_team_for_suite(
         except Exception:
             pass
 
-    def _increment_suite_version(description: Optional[str] = None) -> Optional[int]:
-        """Atomically increment suite-level latest_testcases_version by 1.
+    def _increment_suite_version(
+        description: Optional[str] = None, source_version: Optional[int] = None
+    ) -> Optional[int]:
+        """Atomically increment suite-level latest_version by 1.
 
         - Reads prior agent_state via results_writer.get_suite_state (best-effort)
         - Computes new_version = (prior or 0) + 1
-        - Writes merged state with updated latest_testcases_version
+        - Writes merged state with updated latest_version
         - Appends a short entry to version_history with timestamp and description
         - Returns the new version if successful, else None
         """
         try:
             prior_state = _get_suite_agent_state(suite_id_value) or {}
-            prior_val = prior_state.get("latest_testcases_version")
+            prior_val = prior_state.get("latest_version")
             try:
                 prior_int = int(prior_val) if prior_val is not None else 0
             except Exception:
                 prior_int = 0
             new_version = prior_int + 1
             merged_state = dict(prior_state)
-            merged_state["latest_testcases_version"] = int(new_version)
+            merged_state["latest_version"] = int(new_version)
             # Build/append version history separately
             hist: List[Dict[str, Any]] = []
             try:
@@ -155,6 +157,15 @@ def make_team_for_suite(
                 latest_version=int(new_version),
                 version_history=hist,
             )
+            # Clone artifacts into this new version to keep versions aligned
+            if new_version > 1:
+                try:
+                    src_v = (
+                        int(source_version) if source_version is not None else int(new_version - 1)
+                    )
+                    _clone_current_artifacts_to_version(src_v, int(new_version))
+                except Exception as e:
+                    pass
             # Emit a new_version event
             try:
                 _results_writer.write_event(
@@ -234,6 +245,189 @@ Documents:
             pass
 
         return "Requirements extracted successfully"
+
+    def _clone_current_artifacts_to_version(source_version: int, target_version: int) -> None:
+        """Clone artifacts from a specific source_version to target_version so all artifact types have rows for the target."""
+        # 1) Requirements → copy rows that match source_version into target_version if not already present
+        exists_reqs = (
+            supabase_client.table("requirements")
+            .select("id")
+            .eq("suite_id", suite_id_value)
+            .eq("version", target_version)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not exists_reqs:
+            rows = (
+                supabase_client.table("requirements")
+                .select("content")
+                .eq("suite_id", suite_id_value)
+                .eq("version", source_version)
+                .execute()
+                .data
+                or []
+            )
+            reqs = [
+                r.get("content") for r in rows if isinstance(r.get("content"), dict)
+            ]
+            if reqs:
+                _results_writer.write_requirements(
+                    session_id=suite_id_value,
+                    requirements=reqs,
+                    suite_id=suite_id_value,
+                    version=target_version,
+                    active=True,
+                )
+
+        # 2) Test Cases → copy rows that match source_version into target_version if not already present
+        exists_tcs = (
+            supabase_client.table("test_cases")
+            .select("id")
+            .eq("suite_id", suite_id_value)
+            .eq("version", target_version)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not exists_tcs:
+            # Build map from requirement DB id -> req_code for lookup when writing
+            req_map_rows = (
+                supabase_client.table("requirements")
+                .select("id, req_code")
+                .eq("suite_id", suite_id_value)
+                .execute()
+                .data
+                or []
+            )
+            req_id_to_code: Dict[str, str] = {}
+            for r in req_map_rows:
+                rid = r.get("id")
+                code = r.get("req_code")
+                if rid and code:
+                    req_id_to_code[str(rid)] = str(code)
+
+            # Pull test_cases for the source_version
+            tc_rows = (
+                supabase_client.table("test_cases")
+                .select("requirement_id, content, version")
+                .eq("suite_id", suite_id_value)
+                .eq("version", source_version)
+                .execute()
+                .data
+                or []
+            )
+            bulk_rows: List[Dict[str, Any]] = []
+            for row in tc_rows:
+                rid = (
+                    str(row.get("requirement_id"))
+                    if row.get("requirement_id") is not None
+                    else None
+                )
+                if not rid:
+                    continue
+                req_code = req_id_to_code.get(rid)
+                if not req_code:
+                    continue
+                content = row.get("content")
+                if not isinstance(content, dict):
+                    continue
+                content_with_version = dict(content)
+                content_with_version["version"] = target_version
+                bulk_rows.append(
+                    {
+                        "req_code": str(req_code),
+                        "testcases": content_with_version,
+                        "version": target_version,
+                    }
+                )
+            if bulk_rows:
+                _results_writer.write_testcases_bulk(
+                    session_id=suite_id_value,
+                    suite_id=suite_id_value,
+                    rows=bulk_rows,
+                    version=target_version,
+                    active=True,
+                )
+
+        # 3) Test Design → copy rows that match source_version
+        exists_td = (
+            supabase_client.table("test_designs")
+            .select("id")
+            .eq("suite_id", suite_id_value)
+            .eq("version", target_version)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not exists_td:
+            td_rows = (
+                supabase_client.table("test_designs")
+                .select("id, content, testing_type")
+                .eq("suite_id", suite_id_value)
+                .eq("version", source_version)
+                .execute()
+                .data
+                or []
+            )
+            if td_rows:
+                items = [
+                    {
+                        "content": (td.get("content") or {}),
+                        "testing_type": str(td.get("testing_type") or "integration"),
+                        "version": target_version,
+                    }
+                    for td in td_rows
+                ]
+                _results_writer.write_test_design_bulk(
+                    session_id=suite_id_value,
+                    suite_id=suite_id_value,
+                    items=items,
+                    version=target_version,
+                    active=True,
+                )
+
+        # 4) Viewpoints → copy rows that match source_version
+        exists_vp = (
+            supabase_client.table("viewpoints")
+            .select("id")
+            .eq("suite_id", suite_id_value)
+            .eq("version", target_version)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not exists_vp:
+            vp_rows = (
+                supabase_client.table("viewpoints")
+                .select("content, test_design_id, requirement_id")
+                .eq("suite_id", suite_id_value)
+                .eq("version", source_version)
+                .execute()
+                .data
+                or []
+            )
+            if vp_rows:
+                items = [
+                    {
+                        "content": (vp.get("content") or {}),
+                        "test_design_id": vp.get("test_design_id"),
+                        "requirement_id": vp.get("requirement_id"),
+                        "version": target_version,
+                    }
+                    for vp in vp_rows
+                ]
+                _results_writer.write_viewpoints_bulk(
+                    session_id=suite_id_value,
+                    suite_id=suite_id_value,
+                    items=items,
+                    version=target_version,
+                    active=True,
+                )
 
     def generate_and_store_testcases_for_req(
         req_id: Optional[str] = None, style: str = "json"
@@ -576,28 +770,165 @@ Requirement text:
                 "Generated integration test cases for all requirements"
             )
 
+            # Load latest Integration Test Design (flows) once for bulk path
+            test_design_content_all: Dict[str, Any] = {}
+            test_design_id_value_all: Optional[str] = _SUITE_TEST_DESIGN_ID.get(
+                suite_id_value
+            )
+            try:
+                if test_design_id_value_all:
+                    td_rows_all = (
+                        supabase_client.table("test_designs")
+                        .select("id, content")
+                        .eq("id", test_design_id_value_all)
+                        .limit(1)
+                        .execute()
+                        .data
+                        or []
+                    )
+                else:
+                    td_rows_all = (
+                        supabase_client.table("test_designs")
+                        .select("id, content")
+                        .eq("suite_id", suite_id_value)
+                        .eq("testing_type", "integration")
+                        .order("created_at", desc=True)
+                        .limit(1)
+                        .execute()
+                        .data
+                        or []
+                    )
+                if td_rows_all:
+                    test_design_id_value_all = str(
+                        (td_rows_all[0] or {}).get("id") or test_design_id_value_all
+                    )
+                    cd_all = (td_rows_all[0] or {}).get("content")
+                    if isinstance(cd_all, dict):
+                        test_design_content_all = cd_all
+            except Exception:
+                pass
+
             def _worker(t: tuple[str, str, str]) -> Dict[str, Any]:
                 _rid, _src, _txt = t
+                try:
+                    # Resolve flows linked to this requirement (subset for context)
+                    all_flows_all = (
+                        test_design_content_all.get("flows")
+                        if isinstance(test_design_content_all, dict)
+                        else None
+                    )
+                    linked_flows_local: List[Dict[str, Any]] = []
+                    if isinstance(all_flows_all, list):
+                        for f in all_flows_all:
+                            if not isinstance(f, dict):
+                                continue
+                            req_links = f.get("requirements_linked")
+                            if isinstance(req_links, list) and any(
+                                str(x) == str(_rid) for x in req_links
+                            ):
+                                linked_flows_local.append(
+                                    {
+                                        "id": f.get("id"),
+                                        "name": f.get("name"),
+                                        "description": f.get("description"),
+                                    }
+                                )
+
+                    # Load viewpoints for this requirement as checklist seeds
+                    linked_viewpoints_local: List[Dict[str, Any]] = []
+                    rr = (
+                        supabase_client.table("requirements")
+                        .select("id")
+                        .eq("suite_id", suite_id_value)
+                        .eq("req_code", str(_rid))
+                        .limit(1)
+                        .execute()
+                        .data
+                        or []
+                    )
+                    requirement_row_id_local = (
+                        str((rr[0] or {}).get("id")) if rr else None
+                    )
+                    if requirement_row_id_local:
+                        vp_rows_local = (
+                            supabase_client.table("viewpoints")
+                            .select("name")
+                            .eq("suite_id", suite_id_value)
+                            .eq("requirement_id", requirement_row_id_local)
+                            .execute()
+                            .data
+                            or []
+                        )
+                        for rvp in vp_rows_local:
+                            if isinstance(rvp, dict):
+                                linked_viewpoints_local.append(
+                                    {
+                                        "name": rvp.get("name"),
+                                    }
+                                )
+                except Exception as e:
+                    import logging
+
+                    logger = logging.getLogger(__name__)
+                    logger.exception(e)
+
+                # Build adapted context JSON snippets for prompt
+                try:
+                    flows_ctx_local = json.dumps(
+                        linked_flows_local[:8], ensure_ascii=False
+                    )
+                except Exception:
+                    flows_ctx_local = "[]"
+                try:
+                    vps_ctx_local = json.dumps(
+                        linked_viewpoints_local[:10], ensure_ascii=False
+                    )
+                except Exception:
+                    vps_ctx_local = "[]"
+
                 # Reuse the same prompt structure as single path
                 prompt_local = f"""
-You are an expert Integration Testing engineer. Create concise, high-value INTEGRATION test cases for the requirement below.
-
-Return ONLY a JSON object with EXACTLY the following fields and types (no markdown):
-{{
-  "requirement_id": "{_rid}",
-  "source": "{_src}",
-  "testing_type": "integration",
-  "test_design_id": "{_SUITE_TEST_DESIGN_ID.get(suite_id_value) or ''}",
-  "linked_flows": ["<Flow-ID>"],
-  "linked_viewpoints": ["<Viewpoint-Name>"],
-  "cases": [
-    {{"id": "<short id>", "type": "happy|edge|negative|alt", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": "...", "links": {{"flows": ["<Flow-ID>"], "viewpoints": ["<Viewpoint-Name>"]}}}}
-  ]
-}}
-
-Requirement Text:
-{_txt}
-""".strip()
+ You are an expert test designer for Integration Testing (IT).
+ 
+ Input Sources you may use:
+ - Requirement Text (below)
+ - IT Test Design (flows) if provided in context (not always present)
+ - IT Checklist (Viewpoints) if provided in context (not always present)
+@@
+ Return ONLY a JSON object (no markdown) with EXACTLY this shape. The array key must be "cases":
+ {{
+   "requirement_id": "{_rid}",
+   "source": "{_src}",
+   "testing_type": "integration",
+   "test_design_id": "{_SUITE_TEST_DESIGN_ID.get(suite_id_value) or ''}",
+   "linked_flows": ["<Flow-ID>"],
+   "linked_viewpoints": ["<Viewpoint-Name>"],
+   "cases": [
+     {{
+       "id": "<short id>",
+       "type": "happy|edge|negative|alt",
+       "title": "<short>",
+       "preconditions": ["..."],
+       "steps": ["..."],
+       "expected": "...",
+       "links": {{"flows": ["<Flow-ID>"], "viewpoints": ["<Viewpoint-Name>"]}},
+       "flow_description": "<optional: flow description if known>",
+       "scenario": "<optional: checklist scenario/checkpoint>",
+       "name": "<optional: descriptive test case name>",
+       "test_data": [{{"field": "...", "value": "..."}}]
+     }}
+   ]
+ }}
+ 
+ Requirement Text:
+ {_txt}
+ 
+ Linked Flows (subset):
+ {flows_ctx_local}
+ 
+ Viewpoints (subset):
+ {vps_ctx_local}
+ """.strip()
                 resp_local = _oai.chat.completions.create(
                     model=global_settings.openai_model,
                     messages=[
@@ -608,6 +939,7 @@ Requirement Text:
                         {"role": "user", "content": prompt_local},
                     ],
                     reasoning_effort="minimal",
+                    response_format={"type": "json_object"},
                 )
                 raw_local = resp_local.choices[0].message.content or "{}"
                 try:
@@ -739,9 +1071,7 @@ Requirement Text:
             if requirement_row_id:
                 vp_rows = (
                     supabase_client.table("viewpoints")
-                    .select(
-                        "id, requirement_id, name, rationale, content, test_design_id"
-                    )
+                    .select("id, requirement_id, name, content, test_design_id")
                     .eq("suite_id", suite_id_value)
                     .eq("requirement_id", requirement_row_id)
                     .execute()
@@ -753,11 +1083,7 @@ Requirement Text:
             for r in vp_rows:
                 if isinstance(r, dict):
                     linked_viewpoints.append(
-                        {
-                            "id": r.get("id"),
-                            "name": r.get("name"),
-                            "rationale": r.get("rationale"),
-                        }
+                        {"id": r.get("id"), "name": r.get("name")}
                     )
         except Exception:
             linked_viewpoints = []
@@ -780,11 +1106,21 @@ Requirement Text:
 
         # Compose prompt for Integration test case generation
         prompt = f"""
-You are an expert Integration Testing engineer. Create concise, high-value INTEGRATION test cases for the requirement below.
+You are an expert test designer for Integration Testing (IT).
 
-Use ALL provided context (requirement text, linked flows from the Integration Test Design, and per-requirement viewpoints). Where appropriate, align cases to flows and viewpoints.
+Input Sources you may use:
+- Requirement Text (below)
+- IT Test Design (flows) if provided in context (not always present)
+- IT Checklist (Viewpoints) if provided in context (not always present)
 
-Return ONLY a JSON object with EXACTLY the following fields and types (no markdown):
+Rules for Test Case Creation:
+- Coverage: include success, failure, boundary, exception, and non-functional (security, performance, data integrity, interoperability, error recovery, compliance) perspectives where relevant.
+- Traceability: each test case must reference a Flow (by id) and a Checklist item (by viewpoint name) when available.
+- Granularity: a single flow or checklist scenario may yield multiple cases; avoid duplication; keep variations explicit.
+- Clarity: steps must be actionable; expected results measurable; provide test data especially for boundary/negative cases.
+- Validation: if inputs are incomplete or ambiguous, include a short clarification question instead of guessing.
+
+Return ONLY a JSON object (no markdown) with EXACTLY this shape. The array key must be "cases":
 {{
   "requirement_id": "{req_id}",
   "source": "{source}",
@@ -823,6 +1159,7 @@ Viewpoints (subset):
                 {"role": "user", "content": prompt},
             ],
             reasoning_effort="minimal",
+            response_format={"type": "json_object"},
         )
         raw = resp.choices[0].message.content or "{}"
 
@@ -918,7 +1255,35 @@ Viewpoints (subset):
 
         return "Integration test cases generated successfully"
 
-    def edit_testcases_for_req(user_edit_request: str) -> Dict[str, Any]:
+    def restore_suite_version(source_version: int) -> Dict[str, Any]:
+        """Create a new version by cloning artifacts from source_version.
+
+        - Increments the suite version with an auto-generated note, cloning from source_version.
+        - Returns {new_version, restored_from}.
+        """
+        description = f"Restored from v{int(source_version)}"
+        new_version = _increment_suite_version(description, source_version=int(source_version))
+        if new_version is None:
+            raise ValueError("Failed to create new version during restore")
+
+        # Emit event
+        try:
+            _results_writer.write_event(
+                suite_id=suite_id_value,
+                event={
+                    "type": "new_version",
+                    "version": int(new_version),
+                    "description": description,
+                },
+            )
+        except Exception:
+            pass
+
+        return {"new_version": int(new_version), "restored_from": int(source_version)}
+
+    def edit_testcases_for_req(
+        user_edit_request: str, version_note: str
+    ) -> Dict[str, Any]:
         """Edit existing test cases suite-wide based on a freeform user edit request.
 
         Behavior:
@@ -937,7 +1302,18 @@ Viewpoints (subset):
             parts = re.split(r"(\d+)", s)
             return tuple(int(p) if p.isdigit() else p for p in parts)
 
-        # 1) Load requirements for this suite
+        # 1) Bump suite version FIRST, so edits target the latest cloned artifacts
+        try:
+            raw_note = (version_note or "").strip()
+            words = [w for w in re.split(r"\s+", raw_note) if w]
+            if not words:
+                raise ValueError("version_note is required (3 words)")
+            eff_note = " ".join(words[:3])
+        except Exception:
+            raise ValueError("version_note is required (3 words)")
+        edit_suite_version = _increment_suite_version(eff_note)
+
+        # 2) Load requirements for this suite
         try:
             req_rows = (
                 supabase_client.table("requirements")
@@ -985,12 +1361,13 @@ Viewpoints (subset):
             if rcode:
                 req_by_code[str(rcode)] = r
 
-        # 2) Load current test cases for this suite
+        # 3) Load test cases for the JUST-INCREMENTED version (cloned base)
         try:
             tc_rows = (
                 supabase_client.table("test_cases")
                 .select("id, requirement_id, suite_id, content, version")
                 .eq("suite_id", suite_id_value)
+                .eq("version", edit_suite_version)
                 .execute()
                 .data
                 or []
@@ -1054,7 +1431,7 @@ Viewpoints (subset):
                 }
             )
 
-        # 3) Build LLM prompt (sorted by req_code, fallback to requirement_id)
+        # 4) Build LLM prompt (sorted by req_code, fallback to requirement_id)
         brief_requirements_sorted = sorted(
             brief_requirements, key=lambda r: _natural_key(r.get("req_code"))
         )
@@ -1135,10 +1512,7 @@ Viewpoints (subset):
 
         results: List[Dict[str, Any]] = []
         event_edits: List[Dict[str, Any]] = []
-        # Increment suite version once for this bulk edit operation with LLM-provided note
-        edit_suite_version = _increment_suite_version(
-            version_note or "Edited test cases (bulk)"
-        )
+        # Version already incremented; edits will target edit_suite_version
 
         # 4) Apply edits per requirement
         for e in edits:
@@ -1165,11 +1539,7 @@ Viewpoints (subset):
             resolved_req_id = req_row.get("id")
             latest_row = latest_tc_by_req_id.get(str(resolved_req_id))
             try:
-                old_version = (
-                    int((latest_row or {}).get("version"))
-                    if (latest_row or {}).get("version") is not None
-                    else None
-                )
+                old_version = int(edit_suite_version) if edit_suite_version is not None else None
             except Exception:
                 old_version = None
 
@@ -1181,8 +1551,13 @@ Viewpoints (subset):
                 pass
 
             inserted_row_id: Optional[str] = None
-            # Persist via results writer to enforce version/active behavior
+            # Persist via results writer to enforce version/active behavior (overwrite base clone)
             try:
+                # Remove any existing test_cases rows for this requirement at the current edit version
+                try:
+                    supabase_client.table("test_cases").delete().eq("requirement_id", resolved_req_id).eq("version", edit_suite_version).execute()
+                except Exception:
+                    pass
                 _results_writer.write_testcases(
                     session_id=suite_id_value,
                     req_code=str(req_row.get("req_code")),
@@ -1191,7 +1566,7 @@ Viewpoints (subset):
                     version=edit_suite_version,
                     active=True,
                 )
-            except Exception:
+            except Exception as e:
                 pass
 
             results.append(
@@ -1583,26 +1958,10 @@ Documents:
             raise ValueError(f"Invalid JSON from test design generator: {e}")
 
     def generate_viewpoints(style: str = "json") -> Any:
-        """Generate per-requirement Test Viewpoints (no status field).
+        """Generate Integration Test Checklist (IT Viewpoints) with flow/requirement references.
 
-        Definition: A test viewpoint is the perspective or focus area that helps
-        test engineers grasp the big picture of the test design. Viewpoints are
-        abstractions and the source of test cases. Types vary by organization and test.
-
-        Returns JSON by default with shape (no status field in items):
-        {
-          "viewpoints": [
-            {
-              "req_code": "REQ-1",
-              "req_text": "...",
-              "items": [
-                {"name": "Functional", "rationale": "..."},
-                {"name": "Security", "rationale": "..."}
-              ]
-            }
-          ],
-          "summary": "short overview"
-        }
+        - Produces strict JSON containing a table-like "checklist" and a backward-compatible
+          "viewpoints" array (per-requirement items) for persistence.
         """
         # Gather requirements
         reqs = _SUITE_REQUIREMENTS.get(suite_id_value)
@@ -1630,6 +1989,42 @@ Documents:
             except Exception:
                 reqs = []
 
+        # Load latest Integration Test Design (flows) for cross-references
+        test_design_content: Dict[str, Any] = {}
+        test_design_id_value: Optional[str] = _SUITE_TEST_DESIGN_ID.get(suite_id_value)
+        try:
+            if test_design_id_value:
+                td_rows = (
+                    supabase_client.table("test_designs")
+                    .select("id, content")
+                    .eq("id", test_design_id_value)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+            else:
+                td_rows = (
+                    supabase_client.table("test_designs")
+                    .select("id, content")
+                    .eq("suite_id", suite_id_value)
+                    .eq("testing_type", "integration")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+            if td_rows:
+                test_design_id_value = str(
+                    (td_rows[0] or {}).get("id") or test_design_id_value
+                )
+                cd = (td_rows[0] or {}).get("content")
+                if isinstance(cd, dict):
+                    test_design_content = cd
+        except Exception:
+            pass
+
         sdir = SESSIONS_ROOT / suite_id_value
         docs_dir = sdir / "docs"
         blocks: List[str] = []
@@ -1644,19 +2039,53 @@ Documents:
         req_ctx = json.dumps(reqs or [], ensure_ascii=False)
         if len(req_ctx) > 10_000:
             req_ctx = req_ctx[:10_000] + "\n...truncated..."
+        try:
+            flows_ctx = json.dumps(
+                (test_design_content or {}).get("flows", [])[:30], ensure_ascii=False
+            )
+        except Exception:
+            flows_ctx = "[]"
 
+        # Build user-provided instruction prompt to produce a structured checklist and viewpoints
         prompt = (
-            "You are a senior test designer. Create per-requirement TEST VIEWPOINTS for Integration Testing.\n"
-            "Definition: Test viewpoint is a point where test engineers focus attention to grasp the big picture of test design — it is an abstraction and a source of test cases. Types of test viewpoints depend on organizations and/or test.\n\n"
-            "Guidelines:\n"
-            "- Use common categories when relevant: Functional, Data Validation, Error Handling, Security/Privacy, Roles/Permissions/Access Control, Integration Interfaces/APIs, Performance/Scalability, Usability/UX, State/Workflow, Configuration/Environment.\n"
-            "- For each requirement, list 3–7 most relevant viewpoints.\n"
-            "- Do not include any status field.\n"
-            "- Provide a one-line rationale per viewpoint to aid traceability.\n"
-            "- Ensure coverage breadth but keep it concise.\n\n"
-            "Return STRICT JSON ONLY with this shape:\n"
-            '{\n  "viewpoints": [\n    {\n      "req_code": "REQ-1",\n      "req_text": "...",\n      "items": [\n        {"name": "Functional", "rationale": "..."}\n      ]\n    }\n  ],\n  "summary": "<short>"\n}\n\n'
+            "You are an expert Integration Test (IT) designer.\n"
+            "Create an IT Test Checklist (IT Viewpoints) based on: (1) Requirement Documents, (2) Requirement List (Features → Functions → Screens), (3) IT Test Design (Sitemap + Integration Flows with requirement mapping), and (4) Domain Knowledge.\n\n"
+            "Objectives:\n"
+            "- Ensure system-wide coverage including success paths, failure/negative, boundary & edge, exception handling, security, performance & load, usability & accessibility, data integrity & consistency, interoperability, error recovery & resilience, compliance/regulatory, and any other context-relevant perspectives.\n"
+            "\n"
+            "Traceability:\n"
+            "- Every checklist item must link to at least one Requirement ID and/or Integration Flow ID. If no mapping exists, leave the reference arrays empty.\n"
+            "- Treat the checklist as a cross-cutting baseline across modules (not tied to flow order).\n\n"
+            "Return STRICT JSON ONLY with this shape (no markdown, no code blocks):\n"
+            "{\n"
+            '  "checklist": [\n'
+            "    {\n"
+            '      "no": 1,\n'
+            '      "level1": "<Feature/Module>",\n'
+            '      "level2": "<Function>",\n'
+            '      "level3": "<success|fail|boundary|security|...>",\n'
+            '      "scenario": "<Scenario / Checkpoints; use short sentences; bullets may be separated by \\n-">",\n'
+            '      "requirement_references": ["REQ-1"],\n'
+            '      "test_design_references": ["IT-FLOW-01"],\n'
+            '      "integration_test": true\n'
+            "    }\n"
+            "  ],\n"
+            '  "viewpoints": [\n'
+            "    {\n"
+            '      "req_code": "REQ-1",\n'
+            '      "req_text": "...",\n'
+            '      "items": [\n'
+            "        {\n"
+            '          "name": "Security",\n'
+            '          "references": {"requirements": ["REQ-1"], "flows": ["IT-FLOW-01"]}\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ],\n"
+            '  "summary": "<short overview>"\n'
+            "}\n\n"
             f"Requirement List (JSON):\n{req_ctx}\n\n"
+            f"IT Test Design (flows excerpt JSON):\n{flows_ctx}\n\n"
             f"Documents:\n{docs_bundle}\n"
         )
 
@@ -1675,6 +2104,29 @@ Documents:
         try:
             data = json.loads(raw)
             assert isinstance(data, dict)
+            # Ensure viewpoints exist for persistence; synthesize minimal if missing
+            vp = data.get("viewpoints")
+            if not isinstance(vp, list) or not vp:
+                synthesized: List[Dict[str, Any]] = []
+                for r in (reqs or [])[:30]:
+                    if not isinstance(r, dict):
+                        continue
+                    synthesized.append(
+                        {
+                            "req_code": r.get("id"),
+                            "req_text": r.get("text"),
+                            "items": [
+                                {
+                                    "name": "Integration",
+                                    "references": {
+                                        "requirements": [r.get("id")],
+                                        "flows": [],
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                data["viewpoints"] = synthesized
             # Increment suite version first, then persist with this version
             version_now = _increment_suite_version("Generated viewpoints")
             try:
@@ -1682,7 +2134,8 @@ Documents:
                     session_id=suite_id_value,
                     suite_id=suite_id_value,
                     content=data,
-                    test_design_id=_SUITE_TEST_DESIGN_ID.get(suite_id_value),
+                    test_design_id=test_design_id_value
+                    or _SUITE_TEST_DESIGN_ID.get(suite_id_value),
                     testing_type="integration",
                     version=version_now,
                     active=True,
@@ -1897,11 +2350,11 @@ Documents:
         model_client=model_client,
         handoffs=["fetcher", "requirements_extractor", "testcase_writer"],
         tools=[
-            generate_preview,
             ask_user,
             get_requirements_info,
             get_testcases_info,
             identify_gaps,
+            restore_suite_version,
         ],
         system_message=(
             "You are the planner. Keep outputs tiny.\n"
@@ -1914,15 +2367,13 @@ Documents:
             "       On the next reply: if it's 'Yes please', handoff to requirements_extractor. If it's 'CONTINUE', handoff to testcase_writer to generate cases directly from docs.\n"
             "     - Otherwise (no explicit direct test-case request): handoff to requirements_extractor by default.\n"
             "     - If the user's request is to EDIT or UPDATE existing test cases (phrases like 'edit', 'update', 'revise', 'modify', 'tweak steps/titles/expected'):\n"
-            "       Immediately handoff to testcase_writer to run edit_testcases_for_req(user_edit_request).\n"
+            "       Immediately handoff to testcase_writer to run edit_testcases_for_req(user_edit_request, version_note).\n"
             '       If additional clarification is needed, ask the user to specify the scope or examples using ask_user(event_type=\\"sample_confirmation\\", response_to_user=\\"Please describe which areas to adjust (titles, steps, expected outcomes, or specific requirements).\\").\n'
             '  5) After requirements_extractor finishes, it will ask ask_user(event_type=\\"requirements_feedback\\"). Wait for the next user reply.\n'
             "     If the reply is 'Generate test cases', handoff to testcase_writer to generate full test cases; then summarize and write TERMINATE.\n"
             "     If the reply indicates changes or hesitation (anything other than 'Generate test cases'), respond briefly and write TERMINATE.\n"
             "  6) After testcase_writer finishes, respond briefly with a bit of content and the word TERMINATE\n"
             "Notes: After fetcher loads the documents, RUN identify_gaps(). If gaps are found, you must return a short summary that includes the word TERMINATE to end the flow. If no gaps, proceed to the next steps.\n"
-            "Also: Before handing off to requirements_extractor or testcase_writer, run generate_preview then ask_user sample_confirmation (after any quality_confirmation).\n"
-            'Always confirm immediate next steps with the user via ask_user BEFORE proceeding, EXCEPT when the user explicitly requests to edit test cases—then handoff directly to testcase_writer. For example: ask_user(event_type="quality_confirmation", response_to_user="Should I extract requirements first for easier tracking before generating test cases?").\n'
             "If the user has specified a testing focus (e.g., unit or integration), call identify_gaps(testing_type=...). If not, identify_gaps will include 'testing_type_needed' and a follow-up prompt in its JSON/text output.\n"
             "If the user asks questions about existing requirements or test cases, use get_requirements_info(question=...) or get_testcases_info(question=...) to answer conciesly then write TERMINATE.\n"
             "If the user asks to edit test cases, you must handoff/transfer to testcase_writer.\n"
@@ -1937,7 +2388,7 @@ Documents:
         system_message=(
             "Load docs using store_docs_from_blob(doc_names).\n"
             "Reply only: stored, missing. No file content.\n"
-            "Then handoff to planner for preview unless explicitly instructed to continue."
+            "Then handoff back to planner."
         ),
     )
 
@@ -1946,14 +2397,15 @@ Documents:
         model_client=model_client,
         handoffs=["testcase_writer", "planner"],
         tools=[
+            generate_preview,
             extract_and_store_requirements,
             generate_test_design,
             generate_viewpoints,
             ask_user,
         ],
         system_message=(
-            "Call extract_and_store_requirements().\n"
-            "Reply only: requirements_artifact.\n"
+            "Before extracting any requirements or artifacts, you must call generate_preview(preview_mode=\"requirements\") once the user confirms you can continue.\n"
+            "After the user reply and upon re-entry, call extract_and_store_requirements().\n"
             "Next, generate Integration Testing artifacts: call generate_test_design() and generate_viewpoints().\n"
             'Then call ask_user(event_type="requirements_feedback", response_to_user="Requirements extracted and test design + viewpoints prepared. Proceed to generate test cases now?") to request confirmation; this writes an event and TERMINATE.\n'
             "After every ask_user(...) call, immediately transfer back to planner (handoff to planner).\n"
@@ -1966,6 +2418,7 @@ Documents:
         model_client=model_client,
         handoffs=["planner"],
         tools=[
+            generate_preview,
             generate_and_store_testcases_for_req,
             generate_direct_testcases_on_docs,
             edit_testcases_for_req,
@@ -1973,11 +2426,12 @@ Documents:
         ],
         system_message=(
             "You MUST call a tool to act. Never reply with free text.\n"
+            "Before generating any test cases, call generate_preview(preview_mode=\"testcases\") and once the user confirms you can continue.\n"
             "- To generate directly from docs: call generate_direct_testcases_on_docs() and then handoff back to planner.\n"
             "- To generate from extracted requirements: if no specific requirement id is provided, call generate_and_store_testcases_for_req() (all requirements, concurrently).\n"
             "- If a specific requirement id is provided, call generate_and_store_testcases_for_req(req_id).\n"
             "- To generate Integration test cases leveraging Test Design and Viewpoints, call generate_integration_testcases_for_req(req_id?) and then handoff back to planner.\n"
-            "- To edit existing cases suite-wide, call edit_testcases_for_req(user_edit_request).\n"
+            "- To edit existing cases suite-wide, call edit_testcases_for_req(user_edit_request, version_note).\n"
             "After any tool call, immediately handoff back to planner.\n"
             "If the user asks about test cases or requirements information, do not answer; handoff to planner so it can respond using its info tools."
         ),
@@ -2028,11 +2482,11 @@ def _write_full_suite_state(
     latest_version: Optional[int] = None,
     version_history: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    """Write both agent_state and a top-level latest_testcases_version into test_suites.state.
+    """Write both agent_state and a top-level latest_version into test_suites.state.
 
     - Reads existing state to merge.
     - Preserves other keys.
-    - If latest_version is provided, writes it to top-level as latest_testcases_version.
+    - If latest_version is provided, writes it to top-level as latest_version.
     """
     if not suite_id:
         return
@@ -2054,7 +2508,7 @@ def _write_full_suite_state(
         current["agent_state"] = agent_state
         if latest_version is not None:
             try:
-                current["latest_testcases_version"] = int(latest_version)
+                current["latest_version"] = int(latest_version)
             except Exception:
                 pass
         if version_history is not None:
@@ -2119,13 +2573,13 @@ async def run_stream_with_suite(
             )
         yield event
 
-    # Persist both agent_state and top-level latest_testcases_version (if present in agent_state)
+    # Persist both agent_state and top-level latest_version (if present in agent_state)
     try:
         saved_state = await local_team.save_state()
         # If the saved_state carries a latest marker, set it at top-level too
         latest_marker = None
         try:
-            lv = saved_state.get("latest_testcases_version")
+            lv = saved_state.get("latest_version")
             latest_marker = int(lv) if lv is not None else None
         except Exception:
             latest_marker = None

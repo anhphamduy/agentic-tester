@@ -414,7 +414,6 @@ export default function ProjectFolders() {
   const handleCreateFolder = () => {
     if (newFolderName.trim()) {
       // Here you would typically call an API to create the folder
-      console.log("Creating folder:", newFolderName);
       setIsFolderDialogOpen(false);
       setNewFolderName("");
       // You could show a toast notification here

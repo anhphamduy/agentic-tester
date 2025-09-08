@@ -29,7 +29,6 @@ const App = () => {
             password: "testaccount",
           });
         }
-        console.log("Session data:", data);
       } catch (error) {
         // Swallow errors in auto-login for now; app can still render
         console.error("Auto-login failed", error);

@@ -115,6 +115,18 @@ export function ChatPanel({
     inputRef.current?.focus();
   };
 
+  // Visible messages (keep interactive types even if empty content)
+  const visibleMessages = useMemo(() => {
+    try {
+      return (messages || []).filter(m => {
+        if (m?.type === "artifact-selection" || m?.type === "next-step") return true;
+        return Boolean((m?.content || "").trim());
+      });
+    } catch {
+      return messages || [];
+    }
+  }, [messages]);
+
   // Determine the latest version number across all messages (for hiding Restore on latest)
   const latestVersionAcrossMessages = useMemo(() => {
     try {
@@ -175,15 +187,7 @@ export function ChatPanel({
       {/* Messages */}
       <ScrollArea className="flex-1 p-4">
         <div className="space-y-4">
-          {(() => {
-            // Hide empty placeholder messages (e.g., pending AI response) while still
-            // showing special interactive message types like selection chips
-            const visibleMessages = (messages || []).filter(m => {
-              if (m?.type === "artifact-selection" || m?.type === "next-step") return true;
-              return Boolean((m?.content || "").trim());
-            });
-            return visibleMessages.length === 0;
-          })() && <div className="text-center text-muted-foreground py-8">
+          {visibleMessages.length === 0 && <div className="text-center text-muted-foreground py-8">
               <Logo className="mx-auto mb-4" size="lg" iconOnly />
               <p className="text-lg font-medium">Welcome to TestVista</p>
               <p className="text-sm">Start by uploading requirements or asking me to generate test cases</p>
@@ -197,23 +201,37 @@ export function ChatPanel({
               </div>
             </div>}
 
-          {(messages || []).filter(message => {
-            if (message?.type === "artifact-selection" || message?.type === "next-step") return true;
-            return Boolean((message?.content || "").trim());
-          }).map((message, idx) => <div key={message.id} className={cn("flex gap-3", message.role === "user" ? "justify-end" : "justify-start")}>
+          {visibleMessages.map((message, idx) => <div key={message.id} className={cn("flex gap-3", message.role === "user" ? "justify-end" : "justify-start")}>
               {message.role === "ai" && <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
                   <Logo size="sm" iconOnly />
                 </div>}
               
               <div className={cn("max-w-[80%] rounded-lg p-3 text-sm break-words", message.role === "user" ? "bg-primary text-white" : "bg-card border border-border/50 text-card-foreground")}>
                 {message.type === "artifact-selection" ? (
-                  <ArtifactSelectionChips
-                    onConfirm={(selectedArtifacts) => {
-                      onSendMessage(`ARTIFACT_SELECTION:${selectedArtifacts.join(',')}`);
-                    }}
-                  />
+                  (() => {
+                    const disabledByLaterUser = visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()));
+                    return (
+                      <div className={cn("relative", disabledByLaterUser && "opacity-60")}> 
+                        <ArtifactSelectionChips
+                          onConfirm={(selectedArtifacts) => {
+                            if (disabledByLaterUser) return;
+                            onSendMessage(`ARTIFACT_SELECTION:${selectedArtifacts.join(',')}`);
+                          }}
+                        />
+                        {disabledByLaterUser && <div className="absolute inset-0 z-10 cursor-not-allowed"></div>}
+                      </div>
+                    );
+                  })()
                 ) : message.type === "next-step" ? (
-                  <NextStepChips onSelect={handleNextStepSelection} />
+                  (() => {
+                    const disabledByLaterUser = visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()));
+                    return (
+                      <div className={cn("relative", disabledByLaterUser && "opacity-60")}>
+                        <NextStepChips onSelect={handleNextStepSelection} />
+                        {disabledByLaterUser && <div className="absolute inset-0 z-10 cursor-not-allowed"></div>}
+                      </div>
+                    );
+                  })()
                 ) : (
                   message.role === "user" ? (
                     <div className="text-white whitespace-pre-wrap break-words">
@@ -226,8 +244,8 @@ export function ChatPanel({
                           <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
                         </div>
                         <div className="mt-3 flex gap-2">
-                          <Button size="sm" onClick={() => onSendMessage("Extract requirements first")}>Better quality</Button>
-                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Just generate test cases")}>Just generate</Button>
+                          <Button size="sm" onClick={() => onSendMessage("Extract requirements first")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Better quality</Button>
+                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Just generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Just generate</Button>
                         </div>
                       </div>
                     ) : message.type === "sample-confirmation" ? (
@@ -236,8 +254,8 @@ export function ChatPanel({
                           <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
                         </div>
                         <div className="mt-3 flex gap-2">
-                          <Button size="sm" onClick={() => onSendMessage("Yes please")}>Yes</Button>
-                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Another sample")}>Another sample</Button>
+                          <Button size="sm" onClick={() => onSendMessage("Yes please")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Yes</Button>
+                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Another sample")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Another sample</Button>
                         </div>
                       </div>
                     ) : (
@@ -252,7 +270,7 @@ export function ChatPanel({
                                   <ReactMarkdown>{content}</ReactMarkdown>
                                 </div>
                                 <div className="mt-3 flex gap-2">
-                                  <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")}>Continue to generate test cases</Button>
+                                  <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Continue to generate test cases</Button>
                                 </div>
                               </div>
                             );
@@ -316,6 +334,7 @@ export function ChatPanel({
                                           <button
                                             onClick={() => onVersionAction?.({ type: 'restore', versionId: String(seg.version) })}
                                             className="text-xs font-medium px-2 py-1 rounded border border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted"
+                                            disabled={visibleMessages.slice(idx + 1).some(m => m.role === 'user' && Boolean((m?.content || '').trim()))}
                                           >
                                             Restore
                                           </button>
@@ -328,7 +347,7 @@ export function ChatPanel({
                             })}
                             {message.type === 'requirements-feedback' && (
                               <div className="mt-1">
-                                <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")}>Continue to generate test cases</Button>
+                                <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Continue to generate test cases</Button>
                               </div>
                             )}
                           </div>

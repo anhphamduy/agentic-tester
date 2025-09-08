@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 
 interface NextStepChipsProps {
   onSelect: (option: "test-cases" | "viewpoints") => void;
+  disabled?: boolean;
 }
 
 const options = [
@@ -22,7 +23,7 @@ const options = [
   }
 ];
 
-export function NextStepChips({ onSelect }: NextStepChipsProps) {
+export function NextStepChips({ onSelect, disabled = false }: NextStepChipsProps) {
   return (
     <div className="space-y-4">
       <p className="text-sm font-medium text-foreground">What would you like me to generate next?</p>
@@ -36,10 +37,10 @@ export function NextStepChips({ onSelect }: NextStepChipsProps) {
               key={option.id}
               variant="outline"
               className={cn(
-                "cursor-pointer transition-all duration-200 px-3 py-2 text-xs flex items-center gap-2 hover:scale-105",
-                "hover:bg-accent hover:text-accent-foreground"
+                "transition-all duration-200 px-3 py-2 text-xs flex items-center gap-2",
+                disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer hover:scale-105 hover:bg-accent hover:text-accent-foreground"
               )}
-              onClick={() => onSelect(option.id as "test-cases" | "viewpoints")}
+              onClick={() => { if (!disabled) onSelect(option.id as "test-cases" | "viewpoints"); }}
               title={option.description}
             >
               <Icon className="h-3 w-3" />
@@ -50,7 +51,7 @@ export function NextStepChips({ onSelect }: NextStepChipsProps) {
       </div>
 
       <div className="flex justify-end">
-        <span className="text-xs text-muted-foreground">Click on an option to continue</span>
+        <span className="text-xs text-muted-foreground">{disabled ? "Options disabled after a new user message" : "Click on an option to continue"}</span>
       </div>
     </div>
   );

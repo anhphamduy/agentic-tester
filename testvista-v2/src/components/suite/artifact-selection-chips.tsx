@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 
 interface ArtifactSelectionChipsProps {
   onConfirm: (selectedArtifacts: string[]) => void;
+  disabled?: boolean;
 }
 
 const artifacts = [
@@ -35,12 +36,13 @@ const artifacts = [
   }
 ];
 
-export function ArtifactSelectionChips({ onConfirm }: ArtifactSelectionChipsProps) {
+export function ArtifactSelectionChips({ onConfirm, disabled = false }: ArtifactSelectionChipsProps) {
   const [selectedArtifacts, setSelectedArtifacts] = useState<string[]>(
     artifacts.filter(a => a.defaultSelected).map(a => a.id)
   );
 
   const handleArtifactToggle = (artifactId: string) => {
+    if (disabled) return;
     const artifact = artifacts.find(a => a.id === artifactId);
     if (artifact?.disabled) return; // Can't toggle disabled artifacts
     
@@ -52,6 +54,7 @@ export function ArtifactSelectionChips({ onConfirm }: ArtifactSelectionChipsProp
   };
 
   const handleConfirm = () => {
+    if (disabled) return;
     onConfirm(selectedArtifacts);
   };
 
@@ -70,7 +73,7 @@ export function ArtifactSelectionChips({ onConfirm }: ArtifactSelectionChipsProp
               variant={isSelected ? "default" : "outline"}
               className={cn(
                 "cursor-pointer transition-all duration-200 px-3 py-2 text-xs flex items-center gap-2 hover:scale-105",
-                artifact.disabled && "cursor-not-allowed opacity-75",
+                (artifact.disabled || disabled) && "cursor-not-allowed opacity-50",
                 isSelected 
                   ? "bg-primary text-primary-foreground hover:bg-primary/90" 
                   : "hover:bg-accent hover:text-accent-foreground"
@@ -90,6 +93,7 @@ export function ArtifactSelectionChips({ onConfirm }: ArtifactSelectionChipsProp
         <Button 
           onClick={handleConfirm}
           size="sm"
+          disabled={disabled}
         >
           Continue
         </Button>
