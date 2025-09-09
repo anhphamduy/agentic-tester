@@ -182,37 +182,42 @@ export default function SuiteWorkspace() {
         const isQualityAsk = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "quality_confirmation");
         const isSampleAsk = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "sample_confirmation");
         const isReqFeedback = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "requirements_feedback");
+        const isGapsFollowUp = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "gaps_follow_up");
+        const isTestingType = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "testing_type_choice");
         const aiTextMessage = !isUser && String(parsed?.type || "") === "TextMessage" && typeof parsed?.content === "string"
           ? normalizeMarkdown(String(parsed?.content ?? "")).replace(/\bTERMINATE\b/gi, "").trim()
           : null;
+        // Attach preview data into the AI text via a placeholder so ChatPanel can render a modal table
+        let previewDataSuffix: string | null = null;
+        try {
+          if (!isUser && isSampleAsk && parsed && typeof parsed === "object" && parsed.data) {
+            const enc = JSON.stringify(parsed.data);
+            previewDataSuffix = `\n\n<<<PREVIEW_DATA:${enc}>>>`;
+          }
+        } catch {}
+
         const codeBlock = isUser
           ? (typeof parsed?.content === "string"
               ? parsed.content
               : String(parsed?.content ?? ""))
           : (
-              (isQualityAsk || isSampleAsk || isReqFeedback) && typeof (parsed?.response_to_user || parsed?.responseToUser) === "string"
-                ? String(parsed?.response_to_user || parsed?.responseToUser)
-                : (aiTextMessage ?? special ?? (
-              "```json\n" +
-              JSON.stringify(
-                { payload: parsed, created_at: ev.created_at, message_id: ev.message_id },
-                null,
-                2
-              ) +
-              "\n```"
-            ))
+              (isQualityAsk || isSampleAsk || isReqFeedback || isTestingType || isGapsFollowUp) && typeof (parsed?.response_to_user || parsed?.responseToUser) === "string"
+                ? (String(parsed?.response_to_user || parsed?.responseToUser) + (previewDataSuffix || ""))
+                : (aiTextMessage ?? special ?? null)
             );
         const g = (grouped[mid] ||= { createdAt: ev.created_at, user: [], ai: [], aiType: undefined });
         // track earliest createdAt
         if (new Date(ev.created_at).getTime() < new Date(g.createdAt).getTime()) {
           g.createdAt = ev.created_at;
         }
-        if (isUser) g.user.push(codeBlock);
+        if (isUser) g.user.push(codeBlock as string);
         else {
-          g.ai.push(codeBlock);
+          if (codeBlock) g.ai.push(codeBlock as string);
           if (isQualityAsk) g.aiType = "quality-confirmation" as const;
           else if (isSampleAsk) g.aiType = "sample-confirmation" as const;
           else if (isReqFeedback) g.aiType = "requirements-feedback" as const;
+          else if (isTestingType) g.aiType = "testing-type-choice" as const;
+          else if (isGapsFollowUp) g.aiType = "gaps-follow-up" as const;
         }
       });
 
@@ -463,8 +468,8 @@ export default function SuiteWorkspace() {
         return "⏳ I'm analyzing gaps in the documents...";
       }
       if (type === "ToolCallExecutionEvent" && source === "planner" && name === "identify_gaps") {
-        const details = normalizeMarkdown(String(first?.content ?? ""));
-        return details || "Gap analysis completed.";
+        // The execution result will be followed by a friendly ask_user(gaps_follow_up); suppress duplicate text here
+        return null;
       }
 
       // Planner: restore_suite_version request/result
@@ -780,6 +785,7 @@ export default function SuiteWorkspace() {
           const isUser = parsed && parsed.source === "user";
           const mid = String(ev.message_id);
           const special = isUser ? null : renderSpecialAiEvent(parsed);
+          console.log(parsed)
           // If a restore succeeded, force-refresh latest version scoped artifacts
           try {
             if (
@@ -816,8 +822,29 @@ export default function SuiteWorkspace() {
               }, 100);
             }
           } catch {}
+          const isQualityAsk = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "quality_confirmation");
+          const isSampleAsk = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "sample_confirmation");
+          const isTestingType = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "testing_type_choice");
+          const isGapsFollowUp = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "gaps_follow_up");
           const isReqFeedback = !isUser && parsed?.type === "ask_user" && ((parsed?.event_type || parsed?.eventType) === "requirements_feedback");
+          const aiTypeNew: Message["type"] = (
+            isQualityAsk ? "quality-confirmation" :
+            isSampleAsk ? "sample-confirmation" :
+            isReqFeedback ? "requirements-feedback" :
+            isTestingType ? "testing-type-choice" :
+            isGapsFollowUp ? "gaps-follow-up" :
+            "normal"
+          ) as Message["type"];
           const reqFeedbackText = isReqFeedback ? String(parsed?.response_to_user || parsed?.responseToUser || "") : "";
+
+          // Optional preview data suffix for sample-confirmation
+          let previewDataSuffix: string | null = null;
+          try {
+            if (isSampleAsk && parsed && typeof parsed === "object" && parsed.data) {
+              previewDataSuffix = "\n\n<<<PREVIEW_DATA:" + JSON.stringify(parsed.data) + ">>>";
+            }
+          } catch {}
+
           const aiTextMessage = !isUser && String(parsed?.type || "") === "TextMessage" && typeof parsed?.content === "string"
             ? normalizeMarkdown(String(parsed?.content ?? "")).replace(/\bTERMINATE\b/gi, "").trim()
             : null;
@@ -825,15 +852,11 @@ export default function SuiteWorkspace() {
             ? (typeof parsed?.content === "string"
                 ? parsed.content
                 : String(parsed?.content ?? ""))
-            : ((isReqFeedback && reqFeedbackText.trim()) ? reqFeedbackText : (aiTextMessage ?? special ?? (
-                "```json\n" +
-                JSON.stringify(
-                  { payload: parsed, created_at: ev.created_at, message_id: ev.message_id },
-                  null,
-                  2
-                ) +
-                "\n```"
-              )));
+            : (
+                (isQualityAsk || isSampleAsk || isReqFeedback || isTestingType || isGapsFollowUp) && typeof (parsed?.response_to_user || parsed?.responseToUser) === "string"
+                  ? (String(parsed?.response_to_user || parsed?.responseToUser) + (previewDataSuffix || ""))
+                  : (aiTextMessage ?? special ?? "")
+              );
 
           setMessages((prev) => {
             // Find existing user/ai blocks for this message id
@@ -877,21 +900,22 @@ export default function SuiteWorkspace() {
               if (aiIdx >= 0) {
                 next[aiIdx] = {
                   ...next[aiIdx],
-                  content: special === null
-                    ? next[aiIdx].content
-                    : (next[aiIdx].content
+                  content: (codeBlock
+                    ? (next[aiIdx].content
                         ? `${next[aiIdx].content}\n\n${codeBlock}`
-                        : codeBlock),
-                  type: isReqFeedback ? "requirements-feedback" : next[aiIdx].type
+                        : codeBlock)
+                    : next[aiIdx].content),
+                  type: aiTypeNew || next[aiIdx].type
                 } as any;
               } else {
-                if (special !== null) {
+                // For ask_user events, special is often null; still push if we have text content
+                if (special !== null || codeBlock) {
                   next.push({
                     id: `ai-${mid}`,
                     role: "ai",
-                    content: codeBlock,
+                    content: codeBlock || special || "",
                     timestamp: new Date(ev.created_at),
-                    type: isReqFeedback ? "requirements-feedback" : "normal",
+                    type: aiTypeNew,
                   });
                 }
               }

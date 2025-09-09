@@ -19,6 +19,12 @@ from autogen_agentchat.ui import Console
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from openai import OpenAI
 from app.settings import global_settings, blob_storage, results_writer, supabase_client
+from app.prompts import (
+    PLANNER_SYSTEM_MESSAGE,
+    FETCHER_SYSTEM_MESSAGE,
+    REQUIREMENTS_EXTRACTOR_SYSTEM_MESSAGE,
+    TESTCASE_WRITER_SYSTEM_MESSAGE,
+)
 
 # -----------------------------
 # Storage roots / providers
@@ -1628,31 +1634,60 @@ Viewpoints (subset):
         mode = (preview_mode or "").strip().lower()
         if mode == "requirements":
             guidelines = (
-                "- Preview REQUIREMENTS ONLY.\n"
-                "- List a few atomic, verifiable items with brief text and doc names."
+                "- Friendly, user-facing tone.\n"
+                "- Show a tiny sample of REQUIREMENTS that look like the real output (3–6 bullets).\n"
+                "- Each bullet: REQ-like label + short paraphrase + (source doc).\n"
+                "- Add a short section 'What you'll get next' listing: complete deduped REQ-1..n, source mapping, and readiness for Test Design + Viewpoints (integration) or Unit viewpoints.\n"
+                "- End with a one-line friendly follow-up question (e.g., 'Shall I extract requirements now, or show another sample?').\n"
+                "- Keep under ~160 words; plain text (no code blocks)."
             )
         elif mode == "testcases":
             guidelines = (
-                "- Preview TEST CASES ONLY.\n"
-                "- Provide a few short titles, 1-3 bullet steps, and expected outcomes.\n"
-                "- Reference source doc names where helpful."
+                "- Friendly, user-facing tone.\n"
+                "- Show a tiny sample of TEST CASES close to the real output (2–4).\n"
+                "- For each sample: Title line; 1–3 very short steps; Expected result; cite source doc if helpful.\n"
+                "- Add 'What you'll get next': structured JSON per requirement, concise steps/expected, and traceability.\n"
+                "- End with a one-line friendly follow-up question (e.g., 'Proceed to generate test cases now, or see another sample?').\n"
+                "- Keep under ~160 words; plain text (no code blocks)."
+            )
+        elif mode == "test_design":
+            guidelines = (
+                "- Friendly, user-facing tone.\n"
+                "- Show a tiny sample of INTEGRATION TEST DESIGN flows (1–3).\n"
+                "- Each flow: id, name, short description (A → B → C).\n"
+                "- Add 'What you'll get next': sitemap + flows with requirement mapping.\n"
+                "- End with a one-line friendly follow-up question (e.g., 'Proceed to generate test design now, or see another sample?').\n"
+                "- Keep under ~160 words; plain text."
+            )
+        elif mode == "viewpoints":
+            guidelines = (
+                "- Friendly, user-facing tone.\n"
+                "- Show a tiny sample of VIEWPOINTS/Checklist items (3–6).\n"
+                "- Each item: name and brief scenario; optionally refs (requirements/flows).\n"
+                "- Add 'What you'll get next': structured checklist and per-requirement viewpoints.\n"
+                "- End with a one-line friendly follow-up question (e.g., 'Proceed to generate viewpoints now, or see another sample?').\n"
+                "- Keep under ~160 words; plain text."
             )
         else:
             guidelines = (
-                "- Decide whether to preview requirements, test cases, or both, based on what seems most helpful.\n"
-                "- If requirements: list a few atomic, verifiable items with brief text and doc names.\n"
-                "- If test cases: provide a few short titles, 1-3 bullet steps, and expected outcomes."
+                "- Friendly, user-facing tone.\n"
+                "- Choose the most helpful preview (requirements or test cases) and show small, realistic samples.\n"
+                "- Include a short 'What you'll get next' section aligned with what will be generated.\n"
+                "- End with a one-line friendly follow-up question inviting continue or another sample.\n"
+                "- Keep under ~160 words; plain text (no code blocks)."
             )
 
         prompt = f"""
-You are assisting with a SHORT PREVIEW for a test suite.
+You are assisting with a SHORT, FRIENDLY PREVIEW for a test suite. The preview must look very close to the artifacts that will actually be generated next.
 
 Guidelines:
 {guidelines}
-- Keep it under ~200 words, easy to skim.
-- Do not include large excerpts from the docs.
+- Use short sentences and bullet lists; easy to skim.
+- Avoid large excerpts from docs; derive content from them.
 
-{user_ask_section}Documents:
+Context from user (optional): {ask or ''}
+
+Documents:
 {bundle}
 """.strip()
 
@@ -1661,15 +1696,251 @@ Guidelines:
             messages=[
                 {
                     "role": "system",
-                    "content": "Return a compact, readable preview. No code blocks unless necessary.",
+                    "content": "Return a friendly, user-facing preview that mirrors the upcoming artifacts. Use bullet lists and short sentences. No code blocks. Keep under ~160 words.",
                 },
                 {"role": "user", "content": prompt},
             ],
             reasoning_effort="minimal",
         )
+        preview_text = resp.choices[0].message.content or ""
+
+        # Build a small structured preview list for modal table display in the UI
+        preview_data: Dict[str, Any] = {"preview_mode": mode or "auto"}
+
+        # Generate a tiny requirements sample (3–6 items) similar to extract_and_store_requirements
+        try:
+            req_sample_prompt = f"""
+You are a strict requirements extractor.
+From the provided documents, output a SMALL list of 3–6 atomic, verifiable requirements.
+
+Rules:
+- Each item must be testable and standalone.
+- Keep original meaning; do not add new constraints.
+- Include the source doc name for each requirement.
+- IDs must be REQ-1, REQ-2, ... in order of appearance.
+
+Return STRICT JSON only:
+{{
+  "requirements_sample": [
+    {{"id":"REQ-1","source":"<doc_name>","text":"<requirement>"}}
+  ]
+}}
+
+Documents:
+{bundle}
+""".strip()
+            req_resp = _oai.chat.completions.create(
+                model=global_settings.openai_model,
+                messages=[
+                    {"role": "system", "content": "Return strict JSON only; no extra text."},
+                    {"role": "user", "content": req_sample_prompt},
+                ],
+                reasoning_effort="minimal",
+                response_format={"type": "json_object"},
+            )
+            req_raw = req_resp.choices[0].message.content or "{}"
+            req_obj = json.loads(req_raw)
+            req_sample = req_obj.get("requirements_sample") or []
+            if not isinstance(req_sample, list):
+                req_sample = []
+        except Exception:
+            req_sample = []
+
+        req_rows = [
+            {"id": str((r or {}).get("id")), "source": str((r or {}).get("source")), "text": str((r or {}).get("text"))}
+            for r in (req_sample or [])
+            if isinstance(r, dict)
+        ][:6]
+
+        # Generate a tiny test cases sample aligned with generate_and_store_testcases_for_req
+        # Use the first requirement sample if available, otherwise let the model propose a plausible requirement.
+        try:
+            sample_req = next((r for r in (req_rows or []) if isinstance(r, dict)), None)
+            sample_req_id = (sample_req or {}).get("id") or "REQ-1"
+            sample_req_src = (sample_req or {}).get("source") or "unknown.txt"
+            sample_req_text = (sample_req or {}).get("text") or "A core functional requirement derived from the documents."
+
+            tc_sample_prompt = f"""
+You are a precise QA engineer. Write three concise, testable cases (happy, edge, negative) for the requirement below.
+
+Return STRICT JSON only with EXACTLY this shape:
+{{
+  "requirement_id": "{sample_req_id}",
+  "source": "{sample_req_src}",
+  "requirement_text": "<brief restatement>",
+  "cases": [
+    {{"id": "TC-1", "type": "happy", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
+    {{"id": "TC-2", "type": "edge", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": ""}},
+    {{"id": "TC-3", "type": "negative", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}}
+  ]
+}}
+
+Requirement text:
+{sample_req_text}
+""".strip()
+            tc_resp = _oai.chat.completions.create(
+                model=global_settings.openai_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Return strict JSON only; no extra text. Generate compact, testable QA cases with clear steps and expectations.",
+                    },
+                    {"role": "user", "content": tc_sample_prompt},
+                ],
+                reasoning_effort="minimal",
+                response_format={"type": "json_object"},
+            )
+            tc_raw = tc_resp.choices[0].message.content or "{}"
+            tc_obj = json.loads(tc_raw)
+            if not isinstance(tc_obj, dict):
+                tc_obj = {}
+        except Exception:
+            tc_obj = {}
+
+        # Normalize and flatten test case rows for an easy table display
+        def _flatten_tc_rows(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+            try:
+                rid = str(obj.get("requirement_id") or "")
+                src = str(obj.get("source") or "")
+                cases = obj.get("cases") or []
+                rows: List[Dict[str, Any]] = []
+                if isinstance(cases, list):
+                    for c in cases:
+                        if not isinstance(c, dict):
+                            continue
+                        pre = c.get("preconditions")
+                        st = c.get("steps")
+                        pre_s = "\n".join(str(x) for x in pre) if isinstance(pre, list) else (str(pre) if pre is not None else "")
+                        st_s = "\n".join(str(x) for x in st) if isinstance(st, list) else (str(st) if st is not None else "")
+                        rows.append(
+                            {
+                                "requirement_id": rid,
+                                "source": src,
+                                "case_id": str(c.get("id") or ""),
+                                "type": str(c.get("type") or ""),
+                                "title": str(c.get("title") or ""),
+                                "preconditions": pre_s,
+                                "steps": st_s,
+                                "expected": str(c.get("expected") or ""),
+                            }
+                        )
+                return rows
+            except Exception:
+                return []
+
+        tc_rows = _flatten_tc_rows(tc_obj)[:6]
+
+        # Generate a small Viewpoints sample (only when requested)
+        vp_rows: List[Dict[str, Any]] = []
+        if mode == "viewpoints":
+            try:
+                vp_sample_prompt = f"""
+You are creating a SMALL Integration Test Viewpoints sample from the documents.
+Return STRICT JSON only:
+{{
+  "viewpoints_sample": [
+    {{"name": "Security", "scenario": "Auth + data protection checks", "references": {{"requirements": ["REQ-1"], "flows": ["IT-FLOW-01"]}}}}
+  ]
+}}
+
+Documents:
+{bundle}
+""".strip()
+                vp_resp = _oai.chat.completions.create(
+                    model=global_settings.openai_model,
+                    messages=[
+                        {"role": "system", "content": "Return strict JSON only; no extra text."},
+                        {"role": "user", "content": vp_sample_prompt},
+                    ],
+                    reasoning_effort="minimal",
+                    response_format={"type": "json_object"},
+                )
+                vp_raw = vp_resp.choices[0].message.content or "{}"
+                vp_obj = json.loads(vp_raw)
+                vps = vp_obj.get("viewpoints_sample") or []
+                if isinstance(vps, list):
+                    for v in vps[:6]:
+                        if not isinstance(v, dict):
+                            continue
+                        refs = v.get("references") or {}
+                        reqs = ", ".join(str(x) for x in (refs.get("requirements") or []) if x is not None)
+                        flows = ", ".join(str(x) for x in (refs.get("flows") or []) if x is not None)
+                        vp_rows.append({
+                            "name": str(v.get("name") or ""),
+                            "scenario": str(v.get("scenario") or ""),
+                            "requirements": reqs,
+                            "flows": flows,
+                        })
+            except Exception as e:
+
+                vp_rows = []
+
+        # Generate a small Test Design flows sample (only when requested)
+        flow_rows: List[Dict[str, Any]] = []
+        if mode == "test_design":
+            try:
+                td_sample_prompt = f"""
+You are creating a SMALL Integration Test Design sample (flows) from the documents.
+Return STRICT JSON only:
+{{
+  "flows": [
+    {{"id": "IT-FLOW-01", "name": "Login success", "description": "User enters valid credentials → token issued", "requirements_linked": ["REQ-1"]}}
+  ]
+}}
+
+Documents:
+{bundle}
+""".strip()
+                td_resp = _oai.chat.completions.create(
+                    model=global_settings.openai_model,
+                    messages=[
+                        {"role": "system", "content": "Return strict JSON only; no extra text."},
+                        {"role": "user", "content": td_sample_prompt},
+                    ],
+                    reasoning_effort="minimal",
+                    response_format={"type": "json_object"},
+                )
+                td_raw = td_resp.choices[0].message.content or "{}"
+                td_obj = json.loads(td_raw)
+                flows = td_obj.get("flows") or []
+                if isinstance(flows, list):
+                    for f in flows[:6]:
+                        if not isinstance(f, dict):
+                            continue
+                        reqs = ", ".join(str(x) for x in (f.get("requirements_linked") or []) if x is not None)
+                        flow_rows.append({
+                            "id": str(f.get("id") or ""),
+                            "name": str(f.get("name") or ""),
+                            "description": str(f.get("description") or ""),
+                            "requirements": reqs,
+                        })
+            except Exception as e:
+                import traceback
+                flow_rows = []
+
+        # Include only data for the selected preview mode
+        try:
+            if mode == "requirements":
+                preview_data["requirements"] = req_rows
+            elif mode == "testcases":
+                preview_data["testcases"] = tc_rows
+            elif mode == "viewpoints":
+                preview_data["viewpoints"] = vp_rows
+            elif mode == "test_design":
+                preview_data["flows"] = flow_rows
+            else:
+                # Auto: prefer requirements if available, otherwise testcases
+                if req_rows:
+                    preview_data["requirements"] = req_rows
+                elif tc_rows:
+                    preview_data["testcases"] = tc_rows
+        except Exception:
+            pass
+
         return ask_user(
             event_type="sample_confirmation",
-            response_to_user=resp.choices[0].message.content,
+            response_to_user=preview_text,
+            data=preview_data,
         )
 
     def generate_direct_testcases_on_docs(limit_per_doc: int = 6) -> str:
@@ -1743,10 +2014,9 @@ Documents:
             return "No documents available for gap analysis."
         bundle = "\n\n".join(blocks)
 
-        normalized_type = (testing_type or "").strip().lower() or None
+        # Testing type is now chosen via a separate ask_user flow; do not bias gap analysis
+        normalized_type = None
         type_hint = ""
-        if normalized_type in {"unit", "integration", "system"}:
-            type_hint = f"\n\nUser testing focus: {normalized_type} testing. Adjust the gaps and recommendations to emphasize {normalized_type}-testing concerns."
 
         prompt = f"""
 You are a QA analyst. Based ONLY on the documents, identify gaps that would block clean requirements and testing.
@@ -1785,37 +2055,63 @@ Documents:
             has_gaps = bool(data.get("has_gaps"))
             gaps = data.get("gaps") or []
             recs = data.get("recommendations") or []
-            testing_type_needed = bool(data.get("testing_type_needed"))
-            follow_up = data.get("follow_up") or ""
             if not isinstance(gaps, list):
                 gaps = [str(gaps)]
             if not isinstance(recs, list):
                 recs = [str(recs)]
 
+            # Have the model compose a super friendly summary and follow-up question
             if has_gaps and gaps:
-                lines = ["Gap analysis results:"]
-                for g in gaps[:10]:
-                    lines.append(f"- {str(g)}")
-                if recs:
-                    lines.append("\nRecommended actions:")
-                    for r in recs[:10]:
-                        lines.append(f"- {str(r)}")
-                if testing_type_needed:
-                    lines.append("\nAdditional info needed:")
-                    lines.append(
-                        f"- {follow_up or 'Please choose a testing focus: Unit testing, Integration testing, or System testing.'}"
-                    )
-                # Append TERMINATE so the run stops per termination condition
-                lines.append("\nTERMINATE")
-                return "\n".join(lines)
+                compose_prompt = (
+                    "You are a warm, super friendly QA assistant.\n"
+                    "Create a SHORT, upbeat summary of the gap analysis below and end with ONE simple follow-up line that invites the user to continue or add details.\n"
+                    "Rules:\n"
+                    "- 90–140 words total, plain text, no code blocks.\n"
+                    "- Use concise bullets for 'Top gaps' and 'Suggested next steps'.\n"
+                    "- Encouraging, collaborative tone.\n"
+                    "- End with this exact style of question: 'Would you like to skip the gaps and continue, or type additional info?'\n\n"
+                    f"Gaps: {json.dumps(gaps[:8], ensure_ascii=False)}\n"
+                    f"Recommendations: {json.dumps(recs[:8], ensure_ascii=False)}\n"
+                )
+                fr = _oai.chat.completions.create(
+                    model=global_settings.openai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Write an extremely friendly, concise message with a clear single-line follow-up question.",
+                        },
+                        {"role": "user", "content": compose_prompt},
+                    ],
+                    reasoning_effort="minimal",
+                )
+                friendly_text = (
+                    fr.choices[0].message.content
+                    or "I found a few areas that could use clarification. Would you like to skip the gaps and continue, or type additional info?"
+                )
+                return ask_user(event_type="gaps_follow_up", response_to_user=friendly_text)
             else:
-                if testing_type_needed:
-                    msg = (
-                        follow_up
-                        or "Please choose a testing focus: Unit testing, Integration testing, or System testing."
-                    )
-                    return msg
-                return "No significant gaps detected in documents."
+                compose_prompt = (
+                    "You are a warm, super friendly QA assistant.\n"
+                    "No blocking gaps were detected. Write a SHORT, upbeat confirmation and end with ONE simple follow-up line inviting the user to continue or add details.\n"
+                    "Rules: 50–90 words, plain text, no code blocks, one friendly tone.\n"
+                    "End the message with: 'Would you like to skip the gaps and continue, or type additional info?'"
+                )
+                fr = _oai.chat.completions.create(
+                    model=global_settings.openai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Write an extremely friendly, concise message with a clear single-line follow-up question.",
+                        },
+                        {"role": "user", "content": compose_prompt},
+                    ],
+                    reasoning_effort="minimal",
+                )
+                friendly_ok = (
+                    fr.choices[0].message.content
+                    or "Looks good—no blocking gaps found. Would you like to skip the gaps and continue, or type additional info?"
+                )
+                return ask_user(event_type="gaps_follow_up", response_to_user=friendly_ok)
         except Exception as e:
             return f"Gap analysis error: {e}"
 
@@ -2146,7 +2442,7 @@ Documents:
         except Exception as e:
             raise ValueError(f"Invalid JSON from viewpoints generator: {e}")
 
-    def ask_user(event_type: str, response_to_user: str) -> Dict[str, Any]:
+    def ask_user(event_type: str, response_to_user: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Log a user-facing question to events and terminate the flow.
 
         Parameters:
@@ -2161,6 +2457,8 @@ Documents:
             "requirements_feedback",
             "requirements_sample_offer",
             "testcases_sample_offer",
+            "testing_type_choice",
+            "gaps_follow_up",
         }
         if event_type not in allowed_types:
             raise ValueError(f"Unsupported event_type: {event_type}")
@@ -2171,6 +2469,14 @@ Documents:
             "response_to_user": response_to_user,
             "suite_id": suite_id_value,
         }
+
+        if data is not None:
+            try:
+                # Ensure the payload is JSON-serializable and compact
+                _ = json.dumps(data)
+                event_payload["data"] = data
+            except Exception:
+                pass
 
         _results_writer.write_event(
             suite_id=suite_id_value, event=event_payload, message_id=message_id
@@ -2347,7 +2653,7 @@ Documents:
     # Build per-suite agents with closure-bound tools
     planner_local = AssistantAgent(
         "planner",
-        model_client=model_client,
+        model_client=low_model_client,
         handoffs=["fetcher", "requirements_extractor", "testcase_writer"],
         tools=[
             ask_user,
@@ -2356,28 +2662,7 @@ Documents:
             identify_gaps,
             restore_suite_version,
         ],
-        system_message=(
-            "You are the planner. Keep outputs tiny.\n"
-            "Flow:\n"
-            "  1) Parse doc names from the user's message.\n"
-            "  2) Handoff to fetcher to load the docs.\n"
-            "  4) Decide the path based on the user's original intent:\n"
-            "     - If the ask requested to generate test cases from the document straight away:\n"
-            '       You must ask for a quality choice via ask_user(event_type=\\"quality_confirmation\\", response_to_user=\\"Extract requirements first for better quality?\\").\n'
-            "       On the next reply: if it's 'Yes please', handoff to requirements_extractor. If it's 'CONTINUE', handoff to testcase_writer to generate cases directly from docs.\n"
-            "     - Otherwise (no explicit direct test-case request): handoff to requirements_extractor by default.\n"
-            "     - If the user's request is to EDIT or UPDATE existing test cases (phrases like 'edit', 'update', 'revise', 'modify', 'tweak steps/titles/expected'):\n"
-            "       Immediately handoff to testcase_writer to run edit_testcases_for_req(user_edit_request, version_note).\n"
-            '       If additional clarification is needed, ask the user to specify the scope or examples using ask_user(event_type=\\"sample_confirmation\\", response_to_user=\\"Please describe which areas to adjust (titles, steps, expected outcomes, or specific requirements).\\").\n'
-            '  5) After requirements_extractor finishes, it will ask ask_user(event_type=\\"requirements_feedback\\"). Wait for the next user reply.\n'
-            "     If the reply is 'Generate test cases', handoff to testcase_writer to generate full test cases; then summarize and write TERMINATE.\n"
-            "     If the reply indicates changes or hesitation (anything other than 'Generate test cases'), respond briefly and write TERMINATE.\n"
-            "  6) After testcase_writer finishes, respond briefly with a bit of content and the word TERMINATE\n"
-            "Notes: After fetcher loads the documents, RUN identify_gaps(). If gaps are found, you must return a short summary that includes the word TERMINATE to end the flow. If no gaps, proceed to the next steps.\n"
-            "If the user has specified a testing focus (e.g., unit or integration), call identify_gaps(testing_type=...). If not, identify_gaps will include 'testing_type_needed' and a follow-up prompt in its JSON/text output.\n"
-            "If the user asks questions about existing requirements or test cases, use get_requirements_info(question=...) or get_testcases_info(question=...) to answer conciesly then write TERMINATE.\n"
-            "If the user asks to edit test cases, you must handoff/transfer to testcase_writer.\n"
-        ),
+        system_message=PLANNER_SYSTEM_MESSAGE,
     )
 
     fetcher_local = AssistantAgent(
@@ -2385,11 +2670,7 @@ Documents:
         model_client=model_client,
         handoffs=["planner", "requirements_extractor"],
         tools=[store_docs_from_blob],
-        system_message=(
-            "Load docs using store_docs_from_blob(doc_names).\n"
-            "Reply only: stored, missing. No file content.\n"
-            "Then handoff back to planner."
-        ),
+        system_message=FETCHER_SYSTEM_MESSAGE,
     )
 
     requirements_extractor_local = AssistantAgent(
@@ -2403,14 +2684,7 @@ Documents:
             generate_viewpoints,
             ask_user,
         ],
-        system_message=(
-            "Before extracting any requirements or artifacts, you must call generate_preview(preview_mode=\"requirements\") once the user confirms you can continue.\n"
-            "After the user reply and upon re-entry, call extract_and_store_requirements().\n"
-            "Next, generate Integration Testing artifacts: call generate_test_design() and generate_viewpoints().\n"
-            'Then call ask_user(event_type="requirements_feedback", response_to_user="Requirements extracted and test design + viewpoints prepared. Proceed to generate test cases now?") to request confirmation; this writes an event and TERMINATE.\n'
-            "After every ask_user(...) call, immediately transfer back to planner (handoff to planner).\n"
-            "If the user asks about requirements or test cases information at any time, do not answer; handoff to planner so it can respond using its info tools."
-        ),
+        system_message=REQUIREMENTS_EXTRACTOR_SYSTEM_MESSAGE,
     )
 
     testcase_writer_local = AssistantAgent(
@@ -2424,17 +2698,7 @@ Documents:
             edit_testcases_for_req,
             generate_integration_testcases_for_req,
         ],
-        system_message=(
-            "You MUST call a tool to act. Never reply with free text.\n"
-            "Before generating any test cases, call generate_preview(preview_mode=\"testcases\") and once the user confirms you can continue.\n"
-            "- To generate directly from docs: call generate_direct_testcases_on_docs() and then handoff back to planner.\n"
-            "- To generate from extracted requirements: if no specific requirement id is provided, call generate_and_store_testcases_for_req() (all requirements, concurrently).\n"
-            "- If a specific requirement id is provided, call generate_and_store_testcases_for_req(req_id).\n"
-            "- To generate Integration test cases leveraging Test Design and Viewpoints, call generate_integration_testcases_for_req(req_id?) and then handoff back to planner.\n"
-            "- To edit existing cases suite-wide, call edit_testcases_for_req(user_edit_request, version_note).\n"
-            "After any tool call, immediately handoff back to planner.\n"
-            "If the user asks about test cases or requirements information, do not answer; handoff to planner so it can respond using its info tools."
-        ),
+        system_message=TESTCASE_WRITER_SYSTEM_MESSAGE,
     )
 
     return Swarm(
@@ -2457,6 +2721,14 @@ model_client = OpenAIChatCompletionClient(
     api_key=global_settings.openai_api_key,
     reasoning_effort="minimal",
 )
+
+low_model_client = OpenAIChatCompletionClient(
+    model=global_settings.openai_model,
+    parallel_tool_calls=False,
+    api_key=global_settings.openai_api_key,
+    reasoning_effort="low",
+)
+
 
 # Global termination condition
 termination = TextMentionTermination("TERMINATE") | HandoffTermination(target="user")
@@ -2554,7 +2826,7 @@ async def run_stream_with_suite(
 
             if len(_event_payload["content"]) and (
                 _event_payload["content"][0].get("name") == "ask_user"
-                or _event_payload["content"][0].get("name") == "generate_preview"
+                # or _event_payload["content"][0].get("name") == "generate_preview"
             ):
                 continue
         for i in _event_payload.get("tool_calls", []):

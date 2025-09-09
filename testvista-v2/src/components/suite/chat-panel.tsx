@@ -7,7 +7,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Send, Bot, User, Upload, Zap, Target, Plus, Lightbulb, ArrowUp, AtSign, MessageSquare, Clock, FileText, File, RotateCcw, ChevronRight, MoreHorizontal } from "lucide-react";
+import { Send, Bot, User, Upload, Zap, Target, Plus, Lightbulb, ArrowUp, AtSign, MessageSquare, Clock, FileText, File, RotateCcw, ChevronRight, MoreHorizontal, Eye } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
 import { ArtifactSelectionChips } from "./artifact-selection-chips";
@@ -15,12 +15,13 @@ import { NextStepChips } from "./next-step-chips";
 import { Logo } from "@/components/ui/logo";
 import { VersionActionChips } from "./version-action-chips";
 import { VersionAction } from "@/types/version";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 interface Message {
   id: string;
   role: "user" | "ai";
   content: string;
   timestamp: Date;
-  type?: "command" | "normal" | "artifact-selection" | "next-step" | "version-action" | "sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "requirements-sample-offer" | "testcases-sample-offer" | "version-update";
+  type?: "command" | "normal" | "artifact-selection" | "next-step" | "version-action" | "sample-confirmation" | "quality-confirmation" | "requirements-feedback" | "requirements-sample-offer" | "testcases-sample-offer" | "testing-type-choice" | "gaps-follow-up" | "version-update";
   needsImplementation?: boolean;
   implementationPlan?: string;
   versionInfo?: import("@/types/version").ArtifactVersion;
@@ -72,6 +73,8 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [showCommands, setShowCommands] = useState(false);
+  const [showPreviewModal, setShowPreviewModal] = useState(false);
+  const [previewData, setPreviewData] = useState<any | null>(null);
   
   const [showFileMention, setShowFileMention] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -113,6 +116,17 @@ export function ChatPanel({
     setInput(cmd + " ");
     setShowCommands(false);
     inputRef.current?.focus();
+  };
+
+  const extractPreviewData = (text: string): any | null => {
+    try {
+      const re = /<<<PREVIEW_DATA:([\s\S]*?)>>>/;
+      const match = re.exec(text || "");
+      if (!match) return null;
+      const json = JSON.parse(match[1]);
+      if (json && typeof json === "object") return json;
+    } catch {}
+    return null;
   };
 
   // Visible messages (keep interactive types even if empty content)
@@ -243,21 +257,180 @@ export function ChatPanel({
                         <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
                           <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
                         </div>
-                        <div className="mt-3 flex gap-2">
-                          <Button size="sm" onClick={() => onSendMessage("Extract requirements first")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Better quality</Button>
-                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Just generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Just generate</Button>
+                        <div className="mt-3 mb-2 flex gap-2">
+                          <Button
+                            size="sm"
+                            className="h-7 px-3 text-xs"
+                            onClick={() => onSendMessage("Prepare artifacts first")}
+                            disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}
+                          >
+                            Prepare artifacts first
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 px-3 text-xs text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted"
+                            onClick={() => onSendMessage("Generate test cases now")}
+                            disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}
+                          >
+                            Generate test cases now
+                          </Button>
                         </div>
                       </div>
                     ) : message.type === "sample-confirmation" ? (
-                      <div>
-                        <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
-                          <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
-                        </div>
-                        <div className="mt-3 flex gap-2">
-                          <Button size="sm" onClick={() => onSendMessage("Yes please")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Yes</Button>
-                          <Button size="sm" variant="outline" className="text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted" onClick={() => onSendMessage("Another sample")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Another sample</Button>
-                        </div>
-                      </div>
+                      (() => {
+                        const raw = (message.content || '').trim();
+                        const data = extractPreviewData(raw);
+                        const displayText = raw.replace(/<<<PREVIEW_DATA:[\s\S]*?>>>/g, '').trim();
+                        const disabledByLaterUser = visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()));
+
+                        // Split the preview text into ordered segments around VERSION_BUTTON tokens
+                        type Seg = { kind: 'text'; text: string } | { kind: 'version'; version: number; description: string };
+                        const orderedSegments: Seg[] = [];
+                        try {
+                          const re = /<<<VERSION_BUTTON:([\s\S]*?)>>>/g;
+                          let lastIndex = 0;
+                          let match: RegExpExecArray | null;
+                          while ((match = re.exec(displayText)) !== null) {
+                            const idx = match.index;
+                            const before = displayText.slice(lastIndex, idx);
+                            if (before.trim()) orderedSegments.push({ kind: 'text', text: before });
+                            try {
+                              const json = JSON.parse(match[1]);
+                              const v = typeof json?.version === 'number' ? json.version : parseInt(String(json?.version ?? ''), 10);
+                              const d = String(json?.description ?? '');
+                              if (!Number.isNaN(v)) orderedSegments.push({ kind: 'version', version: v, description: d });
+                            } catch {}
+                            lastIndex = re.lastIndex;
+                          }
+                          const after = displayText.slice(lastIndex);
+                          if (after.trim()) orderedSegments.push({ kind: 'text', text: after });
+                        } catch {
+                          if (displayText.trim()) orderedSegments.push({ kind: 'text', text: displayText.trim() });
+                        }
+
+                        return (
+                          <div>
+                            <div className="space-y-3">
+                              {orderedSegments.map((seg, i) => (
+                                seg.kind === 'text' ? (
+                                  <div key={i} className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
+                                    <ReactMarkdown>{seg.text}</ReactMarkdown>
+                                  </div>
+                                ) : (
+                                  <div key={i} className="my-1">
+                                    <div className="rounded-xl border border-border/60 bg-muted/30 px-4 py-3">
+                                      <div className="flex items-start justify-between gap-3">
+                                        <div className="min-w-0 flex-1">
+                                          <div className="text-sm font-medium whitespace-pre-wrap break-words">{seg.description || 'Untitled change'}</div>
+                                          <div className="mt-1 text-xs text-muted-foreground">v{seg.version}</div>
+                                        </div>
+                                        {!(latestVersionAcrossMessages != null && seg.version === latestVersionAcrossMessages) && (
+                                          <div className="flex items-center gap-2">
+                                            <button
+                                              onClick={() => onVersionAction?.({ type: 'restore', versionId: String(seg.version) })}
+                                              className="text-xs font-medium px-2 py-1 rounded border border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted"
+                                              disabled={disabledByLaterUser}
+                                            >
+                                              Restore
+                                            </button>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+                                )
+                              ))}
+                            </div>
+                            {data && (
+                              <div className="mt-3 mb-2">
+                                <div className={cn("relative", disabledByLaterUser && "opacity-60")}> 
+                                  <div className="rounded-xl border border-border/60 bg-muted/30 px-4 py-3">
+                                    <div className="flex items-center justify-between gap-3">
+                                      <div className="min-w-0 flex-1">
+                                        <div className="text-sm font-medium whitespace-pre-wrap break-words">Generated sample</div>
+                                      </div>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        className="h-7 px-3 text-xs"
+                                        onClick={() => { if (!disabledByLaterUser) { setPreviewData(data); setShowPreviewModal(true); } }}
+                                      >
+                                        <Eye className="h-3.5 w-3.5 mr-1" />
+                                        View
+                                      </Button>
+                                    </div>
+                                  </div>
+                                  {disabledByLaterUser && <div className="absolute inset-0 z-10 cursor-not-allowed"></div>}
+                                </div>
+                              </div>
+                            )}
+                            <div className="mt-2 mb-2 w-full flex justify-between gap-2">
+                              <Button
+                                size="sm"
+                                className="h-7 px-3 text-xs flex-1"
+                                onClick={() => onSendMessage("Looks good — continue")}
+                                disabled={disabledByLaterUser}
+                              >
+                                Looks good — continue
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-7 px-3 text-xs text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted flex-1"
+                                onClick={() => onSendMessage("Show another sample")}
+                                disabled={disabledByLaterUser}
+                              >
+                                Show another sample
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      })()
+                    ) : message.type === "testing-type-choice" ? (
+                      (() => {
+                        const disabledByLaterUser = visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()));
+                        return (
+                          <div>
+                            <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
+                              <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
+                            </div>
+                            <div className={cn(
+                              "relative mt-3 mb-2 inline-flex max-w-[380px] w-full rounded-md overflow-hidden border border-border/50 divide-x divide-border/50",
+                              disabledByLaterUser && "opacity-60"
+                            )}>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 text-xs rounded-none flex-1"
+                                onClick={() => onSendMessage("Integration testing")}
+                                disabled={disabledByLaterUser}
+                              >
+                                Integration
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 text-xs rounded-none flex-1"
+                                onClick={() => onSendMessage("Unit testing")}
+                                disabled={disabledByLaterUser}
+                              >
+                                Unit
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 text-xs rounded-none flex-1"
+                                onClick={() => onSendMessage("System testing")}
+                                disabled={disabledByLaterUser}
+                              >
+                                System
+                              </Button>
+                              {disabledByLaterUser && <div className="absolute inset-0 z-10 cursor-not-allowed" />}
+                            </div>
+                          </div>
+                        );
+                      })()
                     ) : (
                       (() => {
                         const content = (message.content || '').trim();
@@ -270,7 +443,19 @@ export function ChatPanel({
                                   <ReactMarkdown>{content}</ReactMarkdown>
                                 </div>
                                 <div className="mt-3 flex gap-2">
-                                  <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Continue to generate test cases</Button>
+                                  <Button size="sm" className="h-7 px-3 text-xs mb-2" onClick={() => onSendMessage("Continue to generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Continue to generate test cases</Button>
+                                </div>
+                              </div>
+                            );
+                          } else if (message.type === 'gaps-follow-up') {
+                            const disabledByLaterUser = visibleMessages.slice(idx + 1).some(m => m.role === 'user' && Boolean((m?.content || '').trim()));
+                            return (
+                              <div>
+                                <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
+                                  <ReactMarkdown>{content}</ReactMarkdown>
+                                </div>
+                                <div className={cn("mt-3 mb-2", disabledByLaterUser && "opacity-60")}> 
+                                  <Button size="sm" className="h-7 px-3 text-xs mb-2" onClick={() => onSendMessage("Skip gaps and continue")} disabled={disabledByLaterUser}>Skip gaps</Button>
                                 </div>
                               </div>
                             );
@@ -347,7 +532,7 @@ export function ChatPanel({
                             })}
                             {message.type === 'requirements-feedback' && (
                               <div className="mt-1">
-                                <Button size="sm" onClick={() => onSendMessage("Continue to generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Continue to generate test cases</Button>
+                                <Button size="sm" className="h-7 px-3 text-xs mb-2" onClick={() => onSendMessage("Continue to generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Continue to generate test cases</Button>
                               </div>
                             )}
                           </div>
@@ -489,5 +674,141 @@ export function ChatPanel({
         </div>
       </div>
 
+      {/* Preview Modal */}
+      <PreviewTableModal open={showPreviewModal} onOpenChange={setShowPreviewModal} data={previewData} />
+
     </TooltipProvider>;
+
+  // Preview Modal rendering outside main return due to TSX constraints
+}
+
+export function PreviewTableModal({ open, onOpenChange, data }: { open: boolean; onOpenChange: (v: boolean) => void; data: any }) {
+  const reqs = Array.isArray(data?.requirements) ? data.requirements : [];
+  const tcs = Array.isArray(data?.testcases) ? data.testcases : [];
+  const flows = Array.isArray(data?.flows) ? data.flows : [];
+  const vps = Array.isArray(data?.viewpoints) ? data.viewpoints : [];
+  const mode = typeof data?.preview_mode === 'string' ? String(data.preview_mode) : '';
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>Preview Sample</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-6">
+          {(reqs.length > 0 && (!mode || mode === 'requirements')) && (
+            <div>
+              <div className="text-sm font-medium mb-2">Requirements (sample)</div>
+              <div className="overflow-x-auto border border-border/50 rounded-md">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/40">
+                    <tr>
+                      <th className="text-left p-2">ID</th>
+                      <th className="text-left p-2">Source</th>
+                      <th className="text-left p-2">Text</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {reqs.map((r: any, i: number) => (
+                      <tr key={i} className="border-t border-border/40">
+                        <td className="p-2 align-top whitespace-nowrap">{String(r?.id ?? '')}</td>
+                        <td className="p-2 align-top whitespace-nowrap">{String(r?.source ?? '')}</td>
+                        <td className="p-2 align-top">{String(r?.text ?? '')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {(tcs.length > 0 && (!mode || mode === 'testcases')) && (
+            <div>
+              <div className="text-sm font-medium mb-2">Test Cases (sample)</div>
+              <div className="overflow-x-auto border border-border/50 rounded-md">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/40">
+                    <tr>
+                      <th className="text-left p-2">Req ID</th>
+                      <th className="text-left p-2">Case ID</th>
+                      <th className="text-left p-2">Type</th>
+                      <th className="text-left p-2">Title</th>
+                      <th className="text-left p-2">Preconditions</th>
+                      <th className="text-left p-2">Steps</th>
+                      <th className="text-left p-2">Expected</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tcs.map((c: any, i: number) => (
+                      <tr key={i} className="border-t border-border/40">
+                        <td className="p-2 align-top whitespace-nowrap">{String(c?.requirement_id ?? '')}</td>
+                        <td className="p-2 align-top whitespace-nowrap">{String(c?.case_id ?? '')}</td>
+                        <td className="p-2 align-top whitespace-nowrap">{String(c?.type ?? '')}</td>
+                        <td className="p-2 align-top">{String(c?.title ?? '')}</td>
+                        <td className="p-2 align-top whitespace-pre-wrap">{String(c?.preconditions ?? '')}</td>
+                        <td className="p-2 align-top whitespace-pre-wrap">{String(c?.steps ?? '')}</td>
+                        <td className="p-2 align-top">{String(c?.expected ?? '')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {(flows.length > 0 && (!mode || mode === 'test_design')) && (
+            <div>
+              <div className="text-sm font-medium mb-2">Test Design Flows (sample)</div>
+              <div className="overflow-x-auto border border-border/50 rounded-md">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/40">
+                    <tr>
+                      <th className="text-left p-2">ID</th>
+                      <th className="text-left p-2">Name</th>
+                      <th className="text-left p-2">Description</th>
+                      <th className="text-left p-2">Requirements</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {flows.map((f: any, i: number) => (
+                      <tr key={i} className="border-t border-border/40">
+                        <td className="p-2 align-top whitespace-nowrap">{String(f?.id ?? '')}</td>
+                        <td className="p-2 align-top whitespace-nowrap">{String(f?.name ?? '')}</td>
+                        <td className="p-2 align-top">{String(f?.description ?? '')}</td>
+                        <td className="p-2 align-top whitespace-nowrap">{String(f?.requirements ?? '')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {(vps.length > 0 && (!mode || mode === 'viewpoints')) && (
+            <div>
+              <div className="text-sm font-medium mb-2">Viewpoints (sample)</div>
+              <div className="overflow-x-auto border border-border/50 rounded-md">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/40">
+                    <tr>
+                      <th className="text-left p-2">Name</th>
+                      <th className="text-left p-2">Scenario</th>
+                      <th className="text-left p-2">Requirements</th>
+                      <th className="text-left p-2">Flows</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vps.map((v: any, i: number) => (
+                      <tr key={i} className="border-t border-border/40">
+                        <td className="p-2 align-top whitespace-nowrap">{String(v?.name ?? '')}</td>
+                        <td className="p-2 align-top">{String(v?.scenario ?? '')}</td>
+                        <td className="p-2 align-top whitespace-nowrap">{String(v?.requirements ?? '')}</td>
+                        <td className="p-2 align-top whitespace-nowrap">{String(v?.flows ?? '')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
 }

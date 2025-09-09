@@ -196,9 +196,10 @@ export function ArtifactsPanel({
           const reqs = Array.isArray(f?.requirements_linked)
             ? f.requirements_linked.join(", ")
             : (Array.isArray(f?.requirements) ? f.requirements.join(", ") : (f?.requirements_linked ?? f?.requirements ?? ""));
-          rows.push({ ...f, requirements_linked: reqs, test_design_id: r?.id, created_at: r?.created_at });
+          // Exclude test_design_id and created_at from table rows to hide these columns
+          rows.push({ ...f, requirements_linked: reqs });
         } else {
-          rows.push({ id: `${r?.id || "TD"}-FLOW-${idx + 1}`, value: String(f), test_design_id: r?.id, created_at: r?.created_at });
+          rows.push({ id: `${r?.id || "TD"}-FLOW-${idx + 1}`, value: String(f) });
         }
       });
     });
