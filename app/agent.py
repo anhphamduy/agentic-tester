@@ -201,19 +201,50 @@ def make_team_for_suite(
         bundle = "\n\n".join(blocks)
 
         prompt = f"""
-You are a strict requirements extractor.
-From the provided documents, output a DEDUPED list of atomic, verifiable requirements.
+You are an expert requirements analyst.
 
-Rules:
-- Each item must be testable and standalone.
-- Keep original meaning; do not add new constraints.
-- Include the source doc name for each requirement.
-- IDs must be REQ-1, REQ-2, ... in order of appearance.
+Instruction for Requirement Analysis
 
-Return ONLY a JSON array (no markdown):
-[
-  {{"id":"REQ-1","source":"<doc_name>","text":"<requirement>"}}
-]
+Task:
+I have uploaded requirement documents. Please read and analyze the uploaded requirement documents from a business perspective, organizing them into major modules, then breaking them down into detailed functions and corresponding screens. Please create a Requirement List following the rules below.
+
+Rules for Structuring:
+- Group requirements hierarchically into: Feature/Module → Function → Screen/Interface.
+- Each item should be atomic, testable, and standalone.
+- Avoid duplication: if multiple requirements describe the same function, merge them into one.
+
+Summarization Guidelines:
+- Summarize each requirement clearly with concise but descriptive names.
+- Preserve numbering or IDs if available in the original document (record them in source_section when applicable).
+- Do not add new constraints; keep original meaning.
+
+Traceability Requirements:
+- For each requirement, include:
+  - feature: Feature/Module name
+  - function: Function name under the feature
+  - screen: Screen/Interface related to the function ("General" if not screen-specific)
+  - text: Requirement description (summarized)
+  - source: Source Document Name (filename)
+  - source_section: Source section / ID (e.g., heading, paragraph number, or requirement ID)
+
+Output Format:
+Return STRICT JSON ONLY (no markdown) with EXACTLY this shape:
+{{
+  "requirements": [
+    {{
+      "id": "REQ-1",
+      "feature": "<Feature / Module>",
+      "function": "<Function>",
+      "screen": "<Screen / Interface>",
+      "text": "<Requirement Description>",
+      "source": "<Source Document Name>",
+      "source_section": "<Source Section / ID>"
+    }}
+  ]
+}}
+
+ID Rules:
+- Use REQ-1, REQ-2, ... in order of appearance UNLESS an explicit requirement ID exists in the document; if so, still number sequentially in id, and place the original in source_section.
 
 Documents:
 {bundle}
@@ -227,10 +258,16 @@ Documents:
             ],
             reasoning_effort="minimal",
         )
-        raw = resp.choices[0].message.content or "[]"
+        raw = resp.choices[0].message.content or "{}"
         try:
-            reqs = json.loads(raw)
-            assert isinstance(reqs, list)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get("requirements"), list):
+                reqs = parsed.get("requirements")
+            elif isinstance(parsed, list):
+                # Backward-compat: accept a plain array of items
+                reqs = parsed
+            else:
+                raise ValueError("Unexpected JSON shape; expected {requirements:[...]}")
         except Exception as e:
             raise ValueError(f"Invalid JSON from extractor: {e}")
 
