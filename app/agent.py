@@ -1994,15 +1994,7 @@ Documents:
         return resp.choices[0].message.content or ""
 
     def identify_gaps(testing_type: Optional[str] = None) -> str:
-        """Analyze fetched documents to identify requirement/test gaps or ambiguities.
-
-        Behavior:
-        - Reads .txt docs from the suite session directory (already fetched by fetcher).
-        - Uses the model to identify missing requirements, ambiguities, conflicts, and test coverage gaps.
-        - Returns a SHORT human-readable summary.
-        - IMPORTANT: If any gaps are found, the returned text MUST include the token 'TERMINATE'
-          so the global termination condition ends the run immediately.
-        """
+        """Analyze docs and return a SHORT natural-language gap summary with sections and actions."""
         sdir = SESSIONS_ROOT / suite_id_value
         docs_dir = sdir / "docs"
         blocks = []
@@ -2010,108 +2002,40 @@ Documents:
             txt = _read_text(p, max_chars=12_000)
             blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
         if not blocks:
-            # No docs → no gaps can be assessed
             return "No documents available for gap analysis."
         bundle = "\n\n".join(blocks)
 
-        # Testing type is now chosen via a separate ask_user flow; do not bias gap analysis
-        normalized_type = None
-        type_hint = ""
-
+        # Generate a concise, warm, natural-language summary listing Doc + Section + Gap + Action
         prompt = f"""
-You are a QA analyst. Based ONLY on the documents, identify gaps that would block clean requirements and testing.
+You are a warm, supportive QA analyst. Based ONLY on the documents, summarize gaps in a super friendly, human tone.
 
-Return ONLY JSON (no markdown):
-{{
-  "has_gaps": <true|false>,
-  "gaps": ["<concise gap/ambiguity/assumption>", "..."] ,
-  "recommendations": ["<short action>", "..."],
-  "testing_type_needed": <true|false>,
-  "testing_type_options": ["unit", "integration", "system"],
-  "follow_up": "<if testing_type_needed is true, ask user to choose unit, integration, or system>"
-}}
+Write:
+- A short, upbeat opener (you may use 1–2 light emojis like ✨🔧).
+- Exactly 4 friendly points (bullets or short lines). Each point must naturally mention: the document name, the section (or "General" if unclear), what the gap is, and a short suggested action. Feel free to phrase it conversationally.
+- End with one short, cheerful question that offers the choice to either skip the gaps and continue, or type extra details to supplement — wording can vary; do not use a fixed phrase.
 
-Consider: missing acceptance criteria, undefined terms, conflicting statements, non-testable language, unclear boundaries, missing error handling, and data/role/permission gaps.
+Keep it warm, reassuring, and concise (~70–110 words). No JSON. No code blocks.
 
 Documents:
 {bundle}
-{type_hint}
 """.strip()
 
         try:
-            resp = _oai.chat.completions.create(
+            fr = _oai.chat.completions.create(
                 model=global_settings.openai_model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "Return strict JSON only; no extra text.",
+                        "content": "Return plain text only in a super friendly tone: a short opener, exactly 4 friendly points (bullets or lines) each covering doc, section, gap, action, then a short cheerful closing question that offers either to skip the gaps and continue, or add/supplement details. Wording can vary. No JSON.",
                     },
                     {"role": "user", "content": prompt},
                 ],
                 reasoning_effort="minimal",
             )
-            raw = resp.choices[0].message.content or "{}"
-            data = json.loads(raw)
-            has_gaps = bool(data.get("has_gaps"))
-            gaps = data.get("gaps") or []
-            recs = data.get("recommendations") or []
-            if not isinstance(gaps, list):
-                gaps = [str(gaps)]
-            if not isinstance(recs, list):
-                recs = [str(recs)]
-
-            # Have the model compose a super friendly summary and follow-up question
-            if has_gaps and gaps:
-                compose_prompt = (
-                    "You are a warm, super friendly QA assistant.\n"
-                    "Create a SHORT, upbeat summary of the gap analysis below and end with ONE simple follow-up line that invites the user to continue or add details.\n"
-                    "Rules:\n"
-                    "- 90–140 words total, plain text, no code blocks.\n"
-                    "- Use concise bullets for 'Top gaps' and 'Suggested next steps'.\n"
-                    "- Encouraging, collaborative tone.\n"
-                    "- End with this exact style of question: 'Would you like to skip the gaps and continue, or type additional info?'\n\n"
-                    f"Gaps: {json.dumps(gaps[:8], ensure_ascii=False)}\n"
-                    f"Recommendations: {json.dumps(recs[:8], ensure_ascii=False)}\n"
-                )
-                fr = _oai.chat.completions.create(
-                    model=global_settings.openai_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Write an extremely friendly, concise message with a clear single-line follow-up question.",
-                        },
-                        {"role": "user", "content": compose_prompt},
-                    ],
-                    reasoning_effort="minimal",
-                )
-                friendly_text = (
-                    fr.choices[0].message.content
-                    or "I found a few areas that could use clarification. Would you like to skip the gaps and continue, or type additional info?"
-                )
-                return ask_user(event_type="gaps_follow_up", response_to_user=friendly_text)
-            else:
-                compose_prompt = (
-                    "You are a warm, super friendly QA assistant.\n"
-                    "No blocking gaps were detected. Write a SHORT, upbeat confirmation and end with ONE simple follow-up line inviting the user to continue or add details.\n"
-                    "Rules: 50–90 words, plain text, no code blocks, one friendly tone.\n"
-                    "End the message with: 'Would you like to skip the gaps and continue, or type additional info?'"
-                )
-                fr = _oai.chat.completions.create(
-                    model=global_settings.openai_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Write an extremely friendly, concise message with a clear single-line follow-up question.",
-                        },
-                        {"role": "user", "content": compose_prompt},
-                    ],
-                    reasoning_effort="minimal",
-                )
-                friendly_ok = (
-                    fr.choices[0].message.content
-                    or "Looks good—no blocking gaps found. Would you like to skip the gaps and continue, or type additional info?"
-                )
-                return ask_user(event_type="gaps_follow_up", response_to_user=friendly_ok)
+            friendly_text = fr.choices[0].message.content or (
+                "I found a few concise gaps with suggested actions. Shall I proceed and skip these, or would you like to add details?"
+            )
+            return ask_user(event_type="gaps_follow_up", response_to_user=friendly_text)
         except Exception as e:
             return f"Gap analysis error: {e}"
 
