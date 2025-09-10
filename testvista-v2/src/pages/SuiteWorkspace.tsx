@@ -1844,14 +1844,14 @@ export default function SuiteWorkspace() {
           <ChatPanel
             messages={messages}
             onSendMessage={handleSendMessage}
-            isLoading={isLoading}
+            isLoading={isLoading || agentLoading}
             hasUnsavedChanges={versionManager.hasUnsavedChanges}
             onVersionAction={handleVersionAction}
             onViewHistory={() => setShowVersionHistory(true)}
             uploadedFiles={uploadedFiles}
             latestTestcasesVersion={latestSuiteVersion}
           />
-          {initialChatLoading && (
+          {initialChatLoading && !agentLoading && (
             <div className="absolute inset-0 flex items-center justify-center bg-background/70 z-10">
               <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             </div>

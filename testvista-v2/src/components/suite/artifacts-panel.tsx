@@ -598,9 +598,12 @@ export function ArtifactsPanel({
                   ) : dynamicRequirementsRows.length > 0 ? (
                     renderDynamicTable(dynamicRequirementsRows, [
                       "id",
-                      "description",
-                      "priority",
-                      "status",
+                      "feature",
+                      "function",
+                      "screen",
+                      "requirement_description",
+                      "source",
+                      "source_section",
                     ])
                   ) : requirements.length === 0 ? (
                     <div className="p-6 text-center text-sm text-muted-foreground">

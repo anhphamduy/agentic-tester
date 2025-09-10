@@ -546,6 +546,10 @@ class SupabaseResultsWriter(ResultsWriter):
                 first_code = None
                 if isinstance(reqs, list) and reqs:
                     first_code = reqs[0]
+                if first_code is None:
+                    reqs2 = item.get("requirement_references")
+                    if isinstance(reqs2, list) and reqs2:
+                        first_code = reqs2[0]
                 if first_code:
                     return self._get_requirement_row_id(
                         suite_id=suite_id, req_code=str(first_code)
@@ -554,21 +558,46 @@ class SupabaseResultsWriter(ResultsWriter):
                 return None
             return None
 
+        def _derive_item_name(item: Dict[str, Any]) -> str:
+            name_val = item.get("name")
+            if isinstance(name_val, str) and name_val.strip():
+                return name_val
+            l1 = str(item.get("level1") or "").strip()
+            l2 = str(item.get("level2") or "").strip()
+            l3 = str(item.get("level3") or "").strip()
+            scen = str(item.get("scenario") or "").replace("\n", " ").strip()
+            parts = [p for p in [l1, l2, l3] if p]
+            base = " / ".join(parts)
+            if scen:
+                short = scen if len(scen) <= 80 else scen[:77] + "..."
+                return f"{base}: {short}" if base else short
+            return base or "Viewpoint"
+
         # Normalize "content" to an iterable of items with an optional req_code
         items_to_write: List[Dict[str, Any]] = []
         if isinstance(content, dict) and isinstance(content.get("viewpoints"), list):
-            # Original grouped format
-            for group in content.get("viewpoints"):
-                if not isinstance(group, dict):
-                    continue
-                req_code_group = group.get("req_code")
-                items = group.get("items") if isinstance(group.get("items"), list) else []
-                for it in items:
+            vp_list = content.get("viewpoints")
+            has_group_shape = any(
+                isinstance(g, dict) and isinstance(g.get("items"), list) for g in vp_list
+            )
+            if has_group_shape:
+                # Original grouped format
+                for group in vp_list:
+                    if not isinstance(group, dict):
+                        continue
+                    req_code_group = group.get("req_code")
+                    items = group.get("items") if isinstance(group.get("items"), list) else []
+                    for it in items:
+                        if isinstance(it, dict):
+                            it_copy = dict(it)
+                            if req_code_group is not None:
+                                it_copy["__req_code"] = req_code_group
+                            items_to_write.append(it_copy)
+            else:
+                # New unified array of row-like viewpoint objects
+                for it in vp_list:
                     if isinstance(it, dict):
-                        it_copy = dict(it)
-                        if req_code_group is not None:
-                            it_copy["__req_code"] = req_code_group
-                        items_to_write.append(it_copy)
+                        items_to_write.append(dict(it))
         elif isinstance(content, dict) and isinstance(content.get("items"), list):
             # Single group with items, possibly with req_code
             req_code_group = content.get("req_code")
@@ -604,15 +633,16 @@ class SupabaseResultsWriter(ResultsWriter):
                 requirement_id_local = _resolve_requirement_id_from_item(it)
 
             # Deactivate prior active with same natural key (suite, requirement, name)
+            name_value = _derive_item_name(it)
             try:
-                self._client.table("viewpoints").update({"active": False}).eq("suite_id", suite_id).eq("requirement_id", requirement_id_local).eq("name", it.get("name")).eq("active", True).execute()
+                self._client.table("viewpoints").update({"active": False}).eq("suite_id", suite_id).eq("requirement_id", requirement_id_local).eq("name", name_value).eq("active", True).execute()
             except Exception:
                 pass
             row = {
                 "suite_id": suite_id,
                 "test_design_id": test_design_id,
                 "requirement_id": requirement_id_local,
-                "name": it.get("name"),
+                "name": name_value,
                 "content": it,
                 "version": version,
                 "active": bool(active),

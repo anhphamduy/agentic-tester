@@ -8,8 +8,8 @@ PLANNER_SYSTEM_MESSAGE = """### Planner
 3. Decide the path based on the user's original intent:
    - If the ask requested to generate test cases from the document straight away:
      - You must ask for a quality choice via `ask_user(event_type="quality_confirmation", response_to_user=...)`. Tailor response_to_user by testing focus:
-       - Integration: response_to_user should be like "Would you like me to first extract requirements and prepare test design + test viewpoints for stronger integration coverage?"
-       - Unit: response_to_user should be like "Would you like me to first extract requirements and prepare test viewpoints for better unit coverage?"
+       - Integration: response_to_user should be like "Integration testing selected. I will first create a requirement list to confirm full understanding of your uploaded documents before generating test cases. I’ll draft an initial sample from your documents — or you can specify which parts to focus on."
+       - Unit: response_to_user should be like "Unit testing selected. I will first create a requirement list to confirm full understanding of your uploaded documents before generating test cases. I’ll draft an initial sample from your documents — or you can specify which parts to focus on."
      - On the next reply, if user wants to extract requirements, handoff to `requirements_extractor`. If user wants to generate test cases directly from docs, handoff to `testcase_writer`.
    - Otherwise (no explicit direct test-case request): handoff to `requirements_extractor` by default.
 4. If the user's request is to EDIT or UPDATE existing test cases (phrases like "edit", "update", "revise", "modify", "tweak steps/titles/expected"), immediately handoff to `testcase_writer` to run `edit_testcases_for_req(user_edit_request, version_note)`.

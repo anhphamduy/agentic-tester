@@ -261,19 +261,10 @@ export function ChatPanel({
                           <Button
                             size="sm"
                             className="h-7 px-3 text-xs"
-                            onClick={() => onSendMessage("Prepare artifacts first")}
+                            onClick={() => onSendMessage("Generate requirements first")}
                             disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}
                           >
-                            Prepare artifacts first
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-7 px-3 text-xs text-muted-foreground border-muted-foreground/20 hover:bg-muted/30 hover:text-muted-foreground focus-visible:ring-muted"
-                            onClick={() => onSendMessage("Generate test cases now")}
-                            disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}
-                          >
-                            Generate test cases now
+                            Generate requirements
                           </Button>
                         </div>
                       </div>

@@ -223,7 +223,7 @@ Traceability Requirements:
   - feature: Feature/Module name
   - function: Function name under the feature
   - screen: Screen/Interface related to the function ("General" if not screen-specific)
-  - text: Requirement description (summarized)
+  - requirement_description: Requirement description (summarized)
   - source: Source Document Name (filename)
   - source_section: Source section / ID (e.g., heading, paragraph number, or requirement ID)
 
@@ -236,7 +236,7 @@ Return STRICT JSON ONLY (no markdown) with EXACTLY this shape:
       "feature": "<Feature / Module>",
       "function": "<Function>",
       "screen": "<Screen / Interface>",
-      "text": "<Requirement Description>",
+      "requirement_description": "<Requirement Description>",
       "source": "<Source Document Name>",
       "source_section": "<Source Section / ID>"
     }}
@@ -267,19 +267,27 @@ Documents:
                 # Backward-compat: accept a plain array of items
                 reqs = parsed
             else:
-                raise ValueError("Unexpected JSON shape; expected {requirements:[...]}")
+                raise ValueError("Unexpected JSON shape; expected {requirements:[...]}" )
         except Exception as e:
             raise ValueError(f"Invalid JSON from extractor: {e}")
 
+        # Normalize keys for compatibility: ensure both 'requirement_description' and 'text'
+        normalized_reqs: List[Dict[str, Any]] = []
+        for r in (reqs or []):
+            if not isinstance(r, dict):
+                continue
+            item = dict(r)
+            normalized_reqs.append(item)
+
         # Cache per suite
-        _SUITE_REQUIREMENTS[suite_id_value] = reqs
+        _SUITE_REQUIREMENTS[suite_id_value] = normalized_reqs
 
         # Increment suite version and persist requirements (best-effort)
         version_now = _increment_suite_version("Requirements extracted")
         try:
             _results_writer.write_requirements(
                 session_id=suite_id_value,
-                requirements=reqs,
+                requirements=normalized_reqs,
                 suite_id=suite_id_value,
                 version=version_now,
                 active=True,
@@ -2303,44 +2311,40 @@ Documents:
         except Exception:
             flows_ctx = "[]"
 
-        # Build user-provided instruction prompt to produce a structured checklist and viewpoints
+        # Build instruction prompt to produce a single unified "viewpoints" checklist (merged; no separate checklist key)
         prompt = (
-            "You are an expert Integration Test (IT) designer.\n"
-            "Create an IT Test Checklist (IT Viewpoints) based on: (1) Requirement Documents, (2) Requirement List (Features → Functions → Screens), (3) IT Test Design (Sitemap + Integration Flows with requirement mapping), and (4) Domain Knowledge.\n\n"
-            "Objectives:\n"
-            "- Ensure system-wide coverage including success paths, failure/negative, boundary & edge, exception handling, security, performance & load, usability & accessibility, data integrity & consistency, interoperability, error recovery & resilience, compliance/regulatory, and any other context-relevant perspectives.\n"
-            "\n"
-            "Traceability:\n"
-            "- Every checklist item must link to at least one Requirement ID and/or Integration Flow ID. If no mapping exists, leave the reference arrays empty.\n"
-            "- Treat the checklist as a cross-cutting baseline across modules (not tied to flow order).\n\n"
-            "Return STRICT JSON ONLY with this shape (no markdown, no code blocks):\n"
+            "# Instruction Prompt for AI\n\n"
+            "You are an expert Integration Test (IT) designer. Your task is to create an IT Test Checklist (IT Viewpoints) based on the following inputs. Produce a cross-cutting baseline of integration test coverage across all modules.\n\n"
+            "## Inputs\n"
+            "1) Requirement Documents (uploaded by user)\n"
+            "2) Requirement List (structured Features → Functions → Screens)\n"
+            "3) IT Test Design (Sitemap + Integration Flows with requirement mapping)\n"
+            "4) Domain Knowledge\n"
+            "   - Identify additional viewpoints critical for coverage (security, compliance, interoperability, data integrity, etc.).\n"
+            "   - Items with no direct requirement/flow mapping are allowed; leave references empty.\n\n"
+            "## Objectives\n"
+            "- Ensure system-wide coverage: success, failure/negative, boundary & edge, exception handling, security, performance & load, usability & accessibility, data integrity & consistency, interoperability, error recovery & resilience, compliance/regulatory, and others suggested by context.\n"
+            "- Treat the checklist as cross-cutting (not tied to any one flow order).\n\n"
+            "## Traceability\n"
+            "- Link each item to Requirement IDs and/or Integration Flow IDs when available.\n"
+            "- If an item is derived purely from domain knowledge, keep both reference arrays empty.\n\n"
+            "## Output Format (STRICT JSON ONLY; no markdown)\n"
+            "Return EXACTLY this shape. Use a single unified array named \"viewpoints\" representing table rows with these fields (no numbering, no suggested flag, no integration_test flag):\n"
             "{\n"
-            '  "checklist": [\n'
+            "  \"viewpoints\": [\n"
             "    {\n"
-            '      "no": 1,\n'
-            '      "level1": "<Feature/Module>",\n'
-            '      "level2": "<Function>",\n'
-            '      "level3": "<success|fail|boundary|security|...>",\n'
-            '      "scenario": "<Scenario / Checkpoints; use short sentences; bullets may be separated by \\n-">",\n'
-            '      "requirement_references": ["REQ-1"],\n'
-            '      "test_design_references": ["IT-FLOW-01"],\n'
-            '      "integration_test": true\n'
+            "      \"level1\": \"<Feature/Module>\",\n"
+            "      \"level2\": \"<Function>\",\n"
+            "      \"level3\": \"<success|fail|boundary|security|...>\",\n"
+            "      \"scenario\": \"<Scenario / Checkpoints; short sentences; bullets allowed using \\\\n - >\",\n"
+            "      \"requirement_references\": [\"REQ-1\"],\n"
+            "      \"test_design_references\": [\"IT-FLOW-01\"]\n"
             "    }\n"
             "  ],\n"
-            '  "viewpoints": [\n'
-            "    {\n"
-            '      "req_code": "REQ-1",\n'
-            '      "req_text": "...",\n'
-            '      "items": [\n'
-            "        {\n"
-            '          "name": "Security",\n'
-            '          "references": {"requirements": ["REQ-1"], "flows": ["IT-FLOW-01"]}\n'
-            "        }\n"
-            "      ]\n"
-            "    }\n"
-            "  ],\n"
-            '  "summary": "<short overview>"\n'
+            "  \"summary\": \"<short overview>\"\n"
             "}\n\n"
+            "Guidance:\n"
+            "- Keep scenarios concise and actionable; use \\\n - bullets when listing checkpoints.\n\n"
             f"Requirement List (JSON):\n{req_ctx}\n\n"
             f"IT Test Design (flows excerpt JSON):\n{flows_ctx}\n\n"
             f"Documents:\n{docs_bundle}\n"
@@ -2361,26 +2365,21 @@ Documents:
         try:
             data = json.loads(raw)
             assert isinstance(data, dict)
-            # Ensure viewpoints exist for persistence; synthesize minimal if missing
+            # Ensure unified viewpoints array exists; synthesize minimal baseline if missing
             vp = data.get("viewpoints")
             if not isinstance(vp, list) or not vp:
                 synthesized: List[Dict[str, Any]] = []
-                for r in (reqs or [])[:30]:
+                for r in (reqs or [])[:15]:
                     if not isinstance(r, dict):
                         continue
                     synthesized.append(
                         {
-                            "req_code": r.get("id"),
-                            "req_text": r.get("text"),
-                            "items": [
-                                {
-                                    "name": "Integration",
-                                    "references": {
-                                        "requirements": [r.get("id")],
-                                        "flows": [],
-                                    },
-                                }
-                            ],
+                            "level1": "General",
+                            "level2": str(r.get("id") or "Requirement"),
+                            "level3": "integration",
+                            "scenario": str(r.get("text") or "Integration validation for requirement"),
+                            "requirement_references": [str(r.get("id"))] if r.get("id") else [],
+                            "test_design_references": []
                         }
                     )
                 data["viewpoints"] = synthesized
