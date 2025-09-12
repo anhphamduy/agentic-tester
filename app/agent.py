@@ -33,6 +33,34 @@ ROOT = Path(__file__).parent
 SESSIONS_ROOT = ROOT / "sessions"
 SESSIONS_ROOT.mkdir(exist_ok=True)
 
+
+class DocumentService:
+    """Service responsible for reading uploaded session documents.
+
+    Provides text bundles used by analysis/generation tools.
+    """
+
+    def __init__(self, sessions_root: Path) -> None:
+        self._sessions_root = sessions_root
+
+    def read_docs_bundle(self, suite_id: str, *, max_chars_per_doc: int = 16000) -> str:
+        sdir = self._sessions_root / suite_id
+        docs_dir = sdir / "docs"
+        blocks: List[str] = []
+        try:
+            for p in sorted(docs_dir.glob("*.txt")):
+                try:
+                    txt = _read_text(p, max_chars=max_chars_per_doc)
+                except Exception:
+                    txt = ""
+                blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
+        except Exception:
+            pass
+        return "\n\n".join(blocks)
+
+
+_doc_service = DocumentService(SESSIONS_ROOT)
+
 # Blob storage provider is initialized in settings
 _blob_storage = blob_storage
 
@@ -190,15 +218,10 @@ def make_team_for_suite(
             return None
 
     def extract_requirements() -> Dict[str, Any]:
-        sdir = SESSIONS_ROOT / suite_id_value
-        docs_dir = sdir / "docs"
-        blocks = []
-        for p in sorted(docs_dir.glob("*.txt")):
-            txt = _read_text(p, max_chars=80_000)
-            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
-        if not blocks:
+        bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=80_000)
+        if not bundle:
             raise ValueError("No .txt docs in suite.")
-        bundle = "\n\n".join(blocks)
+        
 
         # Start gaps analysis concurrently; write event only AFTER requirements are persisted
         def _gaps_worker(bundle_str: str) -> str:
@@ -1723,15 +1746,10 @@ Viewpoints (subset):
         - Adjusts prompt guidelines based on preview_mode.
         - Returns compact, readable text (no strict JSON required).
         """
-        sdir = SESSIONS_ROOT / suite_id_value
-        docs_dir = sdir / "docs"
-        blocks = []
-        for p in sorted(docs_dir.glob("*.txt")):
-            txt = _read_text(p, max_chars=12_000)
-            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
-        if not blocks:
+        bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=12_000)
+        if not bundle:
             raise ValueError("No .txt docs in suite.")
-        bundle = "\n\n".join(blocks)
+        
         user_ask_section = f"\nShort user ask: {ask}\n" if ask else ""
 
         mode = (preview_mode or "").strip().lower()
@@ -2055,15 +2073,10 @@ Documents:
         - Reference source doc names where helpful.
         - Keep the overall output compact and readable.
         """
-        sdir = SESSIONS_ROOT / suite_id_value
-        docs_dir = sdir / "docs"
-        blocks = []
-        for p in sorted(docs_dir.glob("*.txt")):
-            txt = _read_text(p, max_chars=16_000)
-            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
-        if not blocks:
+        bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=16_000)
+        if not bundle:
             raise ValueError("No .txt docs in suite.")
-        bundle = "\n\n".join(blocks)
+        
 
         prompt = f"""
 You are a QA engineer. Generate concise, high-value TEST CASES directly from the documents below.
@@ -2098,15 +2111,9 @@ Documents:
 
     def identify_gaps(testing_type: Optional[str] = None) -> str:
         """Analyze docs and return a SHORT natural-language gap summary with sections and actions."""
-        sdir = SESSIONS_ROOT / suite_id_value
-        docs_dir = sdir / "docs"
-        blocks = []
-        for p in sorted(docs_dir.glob("*.txt")):
-            txt = _read_text(p, max_chars=12_000)
-            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
-        if not blocks:
+        bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=12_000)
+        if not bundle:
             return "No documents available for gap analysis."
-        bundle = "\n\n".join(blocks)
 
         # Generate a concise, warm, natural-language summary listing Doc + Section + Gap + Action
         prompt = f"""
@@ -2188,17 +2195,8 @@ Documents:
             except Exception:
                 reqs = []
 
-        # Read docs context
-        sdir = SESSIONS_ROOT / suite_id_value
-        docs_dir = sdir / "docs"
-        blocks: List[str] = []
-        for p in sorted(docs_dir.glob("*.txt")):
-            try:
-                txt = _read_text(p, max_chars=16_000)
-            except Exception:
-                txt = ""
-            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
-        docs_bundle = "\n\n".join(blocks) if blocks else ""
+        # Read docs context via service
+        docs_bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=16_000)
 
         # Build prompt from user specification
         req_ctx = json.dumps(reqs or [], ensure_ascii=False)
@@ -2250,20 +2248,7 @@ Documents:
         raw = resp.choices[0].message.content or "{}"
         try:
             data = json.loads(raw)
-            assert isinstance(data, dict)
-            # Sanitize: remove unsupported fields from test design output
-            try:
-                for k in ["sitemap_mermaid", "clarifying_questions", "notes"]:
-                    if k in data:
-                        data.pop(k, None)
-                flows = data.get("flows")
-                if isinstance(flows, list):
-                    for f in flows:
-                        if isinstance(f, dict):
-                            f.pop("diagram_mermaid", None)
-                            f.pop("notes", None)
-            except Exception:
-                pass
+
             # Increment suite version first, then persist with this version
             version_now = _increment_suite_version("Generated test design")
             try:
@@ -2351,16 +2336,7 @@ Documents:
         except Exception:
             pass
 
-        sdir = SESSIONS_ROOT / suite_id_value
-        docs_dir = sdir / "docs"
-        blocks: List[str] = []
-        for p in sorted(docs_dir.glob("*.txt")):
-            try:
-                txt = _read_text(p, max_chars=10_000)
-            except Exception:
-                txt = ""
-            blocks.append(f"DOC_NAME: {p.name}\nDOC_TEXT:\n{txt}\nEND_DOC")
-        docs_bundle = "\n\n".join(blocks) if blocks else ""
+        docs_bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=10_000)
 
         req_ctx = json.dumps(reqs or [], ensure_ascii=False)
         if len(req_ctx) > 10_000:
