@@ -2151,18 +2151,14 @@ Documents:
 
         Output JSON shape (no status fields):
         {
-          "sitemap_mermaid": "mermaid\nflowchart TD\n...",
           "flows": [
             {
               "id": "IT-FLOW-01",
               "name": "...",
               "requirements_linked": ["REQ-1", "REQ-2"],
-              "description": "A → B → C",
-              "diagram_mermaid": "mermaid\nflowchart TD\n..."
+              "description": "A → B → C"
             }
-          ],
-          "clarifying_questions": ["..."],
-          "notes": "..."
+          ]
         }
         """
         # Gather requirements (from cache, then DB best-effort)
@@ -2213,35 +2209,29 @@ Documents:
             "Integration Testing Test Design Specification\n\n"
             "Role & Task\n"
             "You are an expert test designer for Integration Testing (IT).\n"
-            "Your task is to create test design artifacts (Sitemap + Screen Flow Diagrams) based on the Requirement List and the uploaded Requirement Documents.\n\n"
+            "Your task is to create test design flows based on the Requirement List and the uploaded Requirement Documents.\n\n"
             "Steps to Follow\n"
             "1. Input Understanding\n"
             "   - Read the provided Requirement List (grouped into Features → Functions → Screens).\n"
             "   - Cross-check with the uploaded Requirement Documents.\n"
             "2. Summarized but Not Limited to Requirements\n"
             "   - Summarize requirements into Integration Flows.\n"
-            "   - If requirements are unclear → raise clarifying questions.\n"
             "   - Suggest additional flows where needed for full business coverage.\n"
             "3. Output Format (Mandatory)\n"
             "   - Return STRICT JSON ONLY with the following shape:\n"
             "   {\n"
-            '     "sitemap_mermaid": "mermaid\\nflowchart TD\\n...",\n'
             '     "flows": [\n'
             "       {\n"
             '         "id": "IT-FLOW-01",\n'
             '         "name": "...",\n'
             '         "requirements_linked": ["REQ-1"],\n'
-            '         "description": "A → B → C",\n'
-            '         "diagram_mermaid": "mermaid\\nflowchart TD\\n..."\n'
+            '         "description": "A → B → C"\n'
             "       }\n"
-            "     ],\n"
-            '     "clarifying_questions": [],\n'
-            '     "notes": ""\n'
+            "     ]\n"
             "   }\n\n"
             "Clarity & Traceability\n"
             "- Every flow must map to Requirement IDs (use the IDs from the list).\n"
-            "- You may include suggested flows if needed for coverage, but do not add a status field.\n"
-            "- Keep diagrams simple.\n\n"
+            "- You may include suggested flows if needed for coverage, but do not add a status field.\n\n"
             f"Requirement List (JSON):\n{req_ctx}\n\n"
             f"Documents:\n{docs_bundle}\n"
         )
@@ -2261,6 +2251,19 @@ Documents:
         try:
             data = json.loads(raw)
             assert isinstance(data, dict)
+            # Sanitize: remove unsupported fields from test design output
+            try:
+                for k in ["sitemap_mermaid", "clarifying_questions", "notes"]:
+                    if k in data:
+                        data.pop(k, None)
+                flows = data.get("flows")
+                if isinstance(flows, list):
+                    for f in flows:
+                        if isinstance(f, dict):
+                            f.pop("diagram_mermaid", None)
+                            f.pop("notes", None)
+            except Exception:
+                pass
             # Increment suite version first, then persist with this version
             version_now = _increment_suite_version("Generated test design")
             try:
@@ -2443,19 +2446,16 @@ Documents:
                 data["viewpoints"] = synthesized
             # Increment suite version first, then persist with this version
             version_now = _increment_suite_version("Generated viewpoints")
-            try:
-                _results_writer.write_viewpoints(
-                    session_id=suite_id_value,
-                    suite_id=suite_id_value,
-                    content=data,
-                    test_design_id=test_design_id_value
-                    or _SUITE_TEST_DESIGN_ID.get(suite_id_value),
-                    testing_type="integration",
-                    version=version_now,
-                    active=True,
-                )
-            except Exception:
-                pass
+            _results_writer.write_viewpoints(
+                session_id=suite_id_value,
+                suite_id=suite_id_value,
+                content=data,
+                test_design_id=test_design_id_value
+                or _SUITE_TEST_DESIGN_ID.get(suite_id_value),
+                testing_type="integration",
+                version=version_now,
+                active=True,
+            )
             return "Viewpoints generated successfully"
         except Exception as e:
             raise ValueError(f"Invalid JSON from viewpoints generator: {e}")

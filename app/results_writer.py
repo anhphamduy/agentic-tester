@@ -599,7 +599,7 @@ class SupabaseResultsWriter(ResultsWriter):
         elif isinstance(content, dict):
             # Single item
             items_to_write.append(dict(content))
-
+        
         for it in items_to_write:
             if not isinstance(it, dict):
                 continue
@@ -618,10 +618,6 @@ class SupabaseResultsWriter(ResultsWriter):
 
             # Deactivate prior active with same natural key (suite, requirement, name)
             name_value = _derive_item_name(it)
-            try:
-                self._client.table("viewpoints").update({"active": False}).eq("suite_id", suite_id).eq("requirement_id", requirement_id_local).eq("name", name_value).eq("active", True).execute()
-            except Exception:
-                pass
             row = {
                 "suite_id": suite_id,
                 "test_design_id": test_design_id,

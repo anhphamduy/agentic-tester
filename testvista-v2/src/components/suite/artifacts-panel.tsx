@@ -812,7 +812,7 @@ export function ArtifactsPanel({
               <CardContent className="p-0 flex-1 min-h-0">
                 <div className="flex-1 h-full overflow-hidden border border-border/50 rounded-md">
                   <div className="h-full overflow-auto">
-                    {renderDynamicTable(tdFlowRows, ["id", "name", "requirements_linked", "description", "diagram_mermaid"]) || (
+                    {renderDynamicTable(tdFlowRows, ["id", "name", "requirements_linked", "description"]) || (
                       <div className="p-6 text-center text-sm text-muted-foreground">No test design available.</div>
                     )}
                   </div>
