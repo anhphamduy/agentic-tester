@@ -289,18 +289,7 @@ class SupabaseResultsWriter(ResultsWriter):
                 }
             )
 
-        # Store as new versioned rows: deactivate prior active then insert
-        for row in rows:
-            # Deactivate previous active row(s) for this key
-            try:
-                q = self._client.table("requirements").update(
-                    {"active": False}
-                ).eq("suite_id", row["suite_id"]).eq("req_code", row["req_code"]).eq("active", True)
-                q.execute()
-            except Exception:
-                pass
-            # Insert new active row with version
-            self._client.table("requirements").insert(row).execute()
+        self._client.table("requirements").insert(rows).execute()
 
     def write_testcases(
         self,
@@ -338,11 +327,6 @@ class SupabaseResultsWriter(ResultsWriter):
             if not req_row_id:
                 return
 
-        # Deactivate existing active test_cases for this requirement_id
-        try:
-            self._client.table("test_cases").update({"active": False}).eq("requirement_id", req_row_id).eq("active", True).execute()
-        except Exception:
-            pass
         # Insert new versioned active row
         self._client.table("test_cases").insert(
             {

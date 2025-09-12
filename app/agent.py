@@ -189,7 +189,7 @@ def make_team_for_suite(
         except Exception:
             return None
 
-    def extract_and_store_requirements() -> Dict[str, Any]:
+    def extract_requirements() -> Dict[str, Any]:
         sdir = SESSIONS_ROOT / suite_id_value
         docs_dir = sdir / "docs"
         blocks = []
@@ -199,6 +199,40 @@ def make_team_for_suite(
         if not blocks:
             raise ValueError("No .txt docs in suite.")
         bundle = "\n\n".join(blocks)
+
+        # Start gaps analysis concurrently; write event only AFTER requirements are persisted
+        def _gaps_worker(bundle_str: str) -> str:
+            try:
+                gaps_prompt = f"""
+You are a warm, supportive QA analyst. Based ONLY on the documents, summarize gaps in a super friendly, human tone.
+
+Write:
+- A short, upbeat opener (you may use 1–2 light emojis like ✨🔧).
+- Exactly 4 friendly points (bullets or short lines). Each point must naturally mention: the document name, the section (or "General" if unclear), what the gap is, and a short suggested action. Feel free to phrase it conversationally.
+- End with one short, cheerful question that offers the choice to either skip the gaps and continue, or type extra details to supplement — wording can vary; do not use a fixed phrase.
+
+Keep it warm, reassuring, and concise (~70–110 words). No JSON. No code blocks.
+
+Documents:
+{bundle_str}
+""".strip()
+                fr_local = _oai.chat.completions.create(
+                    model=global_settings.openai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Return plain text only in a super friendly tone: a short opener, exactly 4 friendly points (bullets or lines) each covering doc, section, gap, action, then a short cheerful closing question that offers either to skip the gaps and continue, or add/supplement details. Wording can vary. No JSON.",
+                        },
+                        {"role": "user", "content": gaps_prompt},
+                    ],
+                    reasoning_effort="minimal",
+                )
+                return fr_local.choices[0].message.content or ""
+            except Exception:
+                return ""
+
+        gaps_executor = ThreadPoolExecutor(max_workers=1)
+        gaps_future = gaps_executor.submit(_gaps_worker, bundle)
 
         prompt = f"""
 You are an expert requirements analyst.
@@ -295,7 +329,30 @@ Documents:
         except Exception:
             pass
 
-        return "Requirements extracted successfully"
+        # After requirements are persisted, collect gaps result and log event
+        gaps_summary_text = ""
+        try:
+            gaps_summary_text = gaps_future.result()
+        except Exception:
+            gaps_summary_text = ""
+        try:
+            gaps_executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+        # Use gaps follow-up as the requirements feedback step
+        try:
+            summary_text = gaps_summary_text or "I didn’t spot any obvious gaps in the docs. Shall we proceed?"
+            return ask_user(
+                event_type="gaps_follow_up",
+                response_to_user=summary_text,
+            )
+        except Exception:
+            return {
+                "status": "ok",
+                "message": "Requirements extracted successfully",
+                "gaps_summary": gaps_summary_text,
+            }
 
     def _clone_current_artifacts_to_version(source_version: int, target_version: int) -> None:
         """Clone artifacts from a specific source_version to target_version so all artifact types have rows for the target."""
@@ -1543,6 +1600,7 @@ Viewpoints (subset):
                     {"role": "user", "content": prompt},
                 ],
                 reasoning_effort="minimal",
+                response_format={"type": "json_object"},
             )
             raw = resp.choices[0].message.content or "{}"
             llm_out = json.loads(raw)
@@ -2639,7 +2697,7 @@ Documents:
         handoffs=["testcase_writer", "planner"],
         tools=[
             generate_preview,
-            extract_and_store_requirements,
+            extract_requirements,
             generate_test_design,
             generate_viewpoints,
             ask_user,
@@ -2686,7 +2744,7 @@ low_model_client = OpenAIChatCompletionClient(
     model=global_settings.openai_model,
     parallel_tool_calls=False,
     api_key=global_settings.openai_api_key,
-    reasoning_effort="low",
+    reasoning_effort="minimal",
 )
 
 
@@ -2799,7 +2857,6 @@ async def run_stream_with_suite(
             and not _event_payload.get("type") == "ToolCallSummaryMessage"
             and not _event_payload.get("type") == "HandoffMessage"
         ):
-            print(_event_payload)
             _results_writer.write_event(
                 suite_id=suite_id, event=_event_payload, message_id=inserted_message_id
             )

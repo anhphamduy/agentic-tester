@@ -261,10 +261,10 @@ export function ChatPanel({
                           <Button
                             size="sm"
                             className="h-7 px-3 text-xs"
-                            onClick={() => onSendMessage("Generate requirements first")}
+                            onClick={() => onSendMessage("Generate artifacts first")}
                             disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}
                           >
-                            Generate requirements
+                            Generate artifacts
                           </Button>
                         </div>
                       </div>

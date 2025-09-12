@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "@/supabase_client";
 import { ChatPanel } from "@/components/suite/chat-panel";
 import { ArtifactsPanel } from "@/components/suite/artifacts-panel";
@@ -146,6 +146,41 @@ export default function SuiteWorkspace() {
   >("requirements");
   const [initialChatLoading, setInitialChatLoading] = useState(true);
   const hasLoadedChatOnce = useRef(false);
+  // Resizable chat panel state/refs
+  const [leftPanelWidth, setLeftPanelWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("suite_left_panel_width");
+      const n = saved ? parseInt(String(saved), 10) : NaN;
+      if (Number.isFinite(n)) return Math.min(Math.max(n, 320), 800);
+    } catch {}
+    return 420;
+  });
+  const isResizingRef = useRef(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const leftWidthRef = useRef(leftPanelWidth);
+  useEffect(() => {
+    leftWidthRef.current = leftPanelWidth;
+  }, [leftPanelWidth]);
+  const onResizeMouseMove = useCallback((e: MouseEvent) => {
+    if (!isResizingRef.current || !containerRef.current) return;
+    const bounds = containerRef.current.getBoundingClientRect();
+    const minLeft = 320; // px
+    const minRight = 360; // ensure artifacts panel keeps room
+    const maxLeft = Math.max(minLeft, Math.min(800, bounds.width - minRight));
+    let next = e.clientX - bounds.left;
+    if (next < minLeft) next = minLeft;
+    if (next > maxLeft) next = maxLeft;
+    setLeftPanelWidth(next);
+  }, []);
+  const onResizeMouseUp = useCallback(() => {
+    if (!isResizingRef.current) return;
+    isResizingRef.current = false;
+    try {
+      localStorage.setItem("suite_left_panel_width", String(leftWidthRef.current));
+    } catch {}
+    window.removeEventListener("mousemove", onResizeMouseMove);
+    window.removeEventListener("mouseup", onResizeMouseUp);
+  }, [onResizeMouseMove]);
   // Track latest suite version from test_suites.state
   const [latestSuiteVersion, setLatestSuiteVersion] = useState<
     number | undefined
@@ -390,10 +425,10 @@ export default function SuiteWorkspace() {
         return `<<<VERSION_BUTTON:${body}>>>`;
       }
       // Requirements extractor progress messages
-      if (type === "ToolCallRequestEvent" && source === "requirements_extractor" && name === "extract_and_store_requirements") {
+      if (type === "ToolCallRequestEvent" && source === "requirements_extractor" && name === "extract_requirements") {
         return "⏳ Generating requirements...";
       }
-      if (type === "ToolCallExecutionEvent" && source === "requirements_extractor" && name === "extract_and_store_requirements") {
+      if (type === "ToolCallExecutionEvent" && source === "requirements_extractor" && name === "extract_requirements") {
         return "✅ Requirements generated successfully.";
       }
       if (type === "ToolCallRequestEvent" && source === "requirements_extractor" && name === "generate_test_design") {
@@ -1009,6 +1044,8 @@ export default function SuiteWorkspace() {
               .eq("suite_id", suiteIdVal)
               .eq("version", version);
             setDynamicTestDesignRows(data || []);
+            // Jump to test design tab on any realtime change
+            setActiveArtifactsTab("test_design");
           } catch (e) {
             console.error("Failed to refresh test designs (realtime)", e);
           }
@@ -1030,6 +1067,8 @@ export default function SuiteWorkspace() {
               .eq("suite_id", suiteIdVal)
               .eq("version", version);
             setDynamicTestViewpointRows(data || []);
+            // Jump to test viewpoints tab on any realtime change
+            setActiveArtifactsTab("test_viewpoints");
           } catch (e) {
             console.error("Failed to refresh viewpoints (realtime)", e);
           }
@@ -1838,9 +1877,12 @@ export default function SuiteWorkspace() {
       </header>
 
       {/* Main Content - Split Screen */}
-      <div className="flex-1 flex overflow-hidden">
+      <div ref={containerRef} className="flex-1 flex overflow-hidden">
         {/* Left Panel - Chat */}
-        <div className="relative w-1/3 min-w-[400px] max-w-[500px] h-full">
+        <div
+          className="relative h-full min-w-[320px] max-w-[800px]"
+          style={{ width: leftPanelWidth }}
+        >
           <ChatPanel
             messages={messages}
             onSendMessage={handleSendMessage}
@@ -1857,6 +1899,16 @@ export default function SuiteWorkspace() {
             </div>
           )}
         </div>
+        {/* Resize handle */}
+        <div
+          className="w-1 bg-border cursor-col-resize hover:bg-primary/50"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            isResizingRef.current = true;
+            window.addEventListener("mousemove", onResizeMouseMove);
+            window.addEventListener("mouseup", onResizeMouseUp);
+          }}
+        />
 
         {/* Right Panel - Artifacts */}
         <div className="flex-1 h-full">

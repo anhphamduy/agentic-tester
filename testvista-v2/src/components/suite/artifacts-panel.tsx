@@ -207,19 +207,31 @@ export function ArtifactsPanel({
   }, [dynamicTestDesignRows]);
   const tdFlowCount = tdFlowRows.length;
   const dbVpCount = dynamicTestViewpointRows.length;
+  const hasAnyArtifacts =
+    (reqCount > 0) || (tcCount > 0) || (vpCount > 0) || (tdFlowCount > 0) || (dbVpCount > 0);
 
   // Ensure we don't stay on hidden tabs when they have no records
   useEffect(() => {
-    if (activeTab === "viewpoints" && vpCount === 0) {
-      handleTabChange("requirements");
+    const getFirstAvailableTab = (): "requirements" | "viewpoints" | "testcases" | "test_design" | "test_viewpoints" => {
+      if (vpCount > 0) return "viewpoints";
+      if (tdFlowCount > 0) return "test_design";
+      if (dbVpCount > 0) return "test_viewpoints";
+      if (reqCount > 0) return "requirements";
+      if (tcCount > 0) return "testcases";
+      return activeTab;
+    };
+
+    const shouldSwitch =
+      (activeTab === "viewpoints" && vpCount === 0) ||
+      (activeTab === "test_design" && tdFlowCount === 0) ||
+      (activeTab === "test_viewpoints" && dbVpCount === 0) ||
+      (activeTab === "requirements" && reqCount === 0) ||
+      (activeTab === "testcases" && tcCount === 0);
+
+    if (shouldSwitch) {
+      handleTabChange(getFirstAvailableTab());
     }
-    if (activeTab === "test_design" && tdFlowCount === 0) {
-      handleTabChange("requirements");
-    }
-    if (activeTab === "test_viewpoints" && dbVpCount === 0) {
-      handleTabChange("requirements");
-    }
-  }, [activeTab, vpCount, tdFlowCount, dbVpCount]);
+  }, [activeTab, vpCount, tdFlowCount, dbVpCount, reqCount, tcCount]);
 
   const renderDynamicTable = (rows: any[], preferredOrder: string[] = []) => {
     if (!rows || rows.length === 0) return null;
@@ -538,16 +550,24 @@ export function ArtifactsPanel({
           </div>
 
           {(() => {
-            const numTabs = 2 + (vpCount > 0 ? 1 : 0) + (tdFlowCount > 0 ? 1 : 0) + (dbVpCount > 0 ? 1 : 0);
+            const numTabs =
+              (reqCount > 0 ? 1 : 0) +
+              (vpCount > 0 ? 1 : 0) +
+              (tdFlowCount > 0 ? 1 : 0) +
+              (dbVpCount > 0 ? 1 : 0) +
+              (tcCount > 0 ? 1 : 0);
+            if (numTabs === 0) return null;
             return (
               <TabsList
                 className="grid w-full mb-0"
                 style={{ gridTemplateColumns: `repeat(${numTabs}, minmax(0, 1fr))` }}
               >
-            <TabsTrigger value="requirements" className="gap-2">
-              <FileText className="h-4 w-4" />
-              Requirements ({reqCount})
-            </TabsTrigger>
+            {reqCount > 0 && (
+              <TabsTrigger value="requirements" className="gap-2">
+                <FileText className="h-4 w-4" />
+                Requirements ({reqCount})
+              </TabsTrigger>
+            )}
             {vpCount > 0 && (
               <TabsTrigger value="viewpoints" className="gap-2">
                 <Target className="h-4 w-4" />
@@ -566,16 +586,40 @@ export function ArtifactsPanel({
                 Test Viewpoints ({dbVpCount})
               </TabsTrigger>
             )}
-            <TabsTrigger value="testcases" className="gap-2">
-              <CheckSquare className="h-4 w-4" />
-              Test Cases ({tcCount})
-            </TabsTrigger>
+            {tcCount > 0 && (
+              <TabsTrigger value="testcases" className="gap-2">
+                <CheckSquare className="h-4 w-4" />
+                Test Cases ({tcCount})
+              </TabsTrigger>
+            )}
               </TabsList>
             );
           })()}
         </div>
 
         {/* Tab Content */}
+        {!hasAnyArtifacts && (
+          <div className="flex-1 m-0 p-4 min-h-0">
+            <Card className="h-full flex flex-col min-h-0">
+              <CardContent className="p-0 flex-1 min-h-0">
+                <div className="flex-1 h-full overflow-hidden border border-border/50 rounded-md">
+                  <div className="h-full w-full flex items-center justify-center p-8">
+                    <div className="flex flex-col items-center text-center gap-3 max-w-md">
+                      <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center">
+                        <FileText className="h-6 w-6 text-muted-foreground" />
+                      </div>
+                      <div className="text-base font-medium">No artifacts yet</div>
+                      <div className="text-sm text-muted-foreground">
+                        Upload documents or ask in chat to generate requirements and test cases. New artifacts will appear here automatically.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        )}
+        {reqCount > 0 && (
         <TabsContent value="requirements" className="flex-1 m-0 p-4 min-h-0">
           <Card className="h-full flex flex-col min-h-0">
             <CardContent className="p-0 flex-1 min-h-0">
@@ -760,6 +804,7 @@ export function ArtifactsPanel({
             </CardContent>
           </Card>
         </TabsContent>
+        )}
 
         {tdFlowCount > 0 && (
           <TabsContent value="test_design" className="flex-1 m-0 p-4 min-h-0">
@@ -793,6 +838,7 @@ export function ArtifactsPanel({
           </TabsContent>
         )}
 
+        {hasAnyArtifacts && (
         <TabsContent value="viewpoints" className="flex-1 m-0 p-4 min-h-0">
           <Card className="h-full flex flex-col min-h-0">
             <CardContent className="p-0 flex-1 min-h-0">
@@ -935,7 +981,9 @@ export function ArtifactsPanel({
             </CardContent>
           </Card>
         </TabsContent>
+        )}
 
+        {tcCount > 0 && (
         <TabsContent value="testcases" className="flex-1 m-0 p-4 min-h-0">
           <Card className="h-full flex flex-col min-h-0">
             <CardContent className="p-0 flex-1 min-h-0">
@@ -1123,6 +1171,7 @@ export function ArtifactsPanel({
             </CardContent>
           </Card>
         </TabsContent>
+        )}
       </Tabs>
     </div>
   );
