@@ -336,186 +336,81 @@ Documents:
         )
 
     def _clone_current_artifacts_to_version(source_version: int, target_version: int) -> None:
-        """Clone artifacts from a specific source_version to target_version so all artifact types have rows for the target."""
-        # 1) Requirements → copy rows that match source_version into target_version if not already present
-        exists_reqs = (
+ 
+        rows = (
             supabase_client.table("requirements")
-            .select("id")
+            .select("content")
             .eq("suite_id", suite_id_value)
-            .eq("version", target_version)
-            .limit(1)
+            .eq("version", source_version)
             .execute()
             .data
             or []
         )
-        if not exists_reqs:
-            rows = (
-                supabase_client.table("requirements")
-                .select("content")
-                .eq("suite_id", suite_id_value)
-                .eq("version", source_version)
-                .execute()
-                .data
-                or []
+        reqs = [
+            r.get("content") for r in rows if isinstance(r.get("content"), dict)
+        ]
+        if reqs:
+            _results_writer.write_requirements(
+                session_id=suite_id_value,
+                requirements=reqs,
+                suite_id=suite_id_value,
+                version=target_version,
             )
-            reqs = [
-                r.get("content") for r in rows if isinstance(r.get("content"), dict)
-            ]
-            if reqs:
-                _results_writer.write_requirements(
-                    session_id=suite_id_value,
-                    requirements=reqs,
-                    suite_id=suite_id_value,
-                    version=target_version,
-                )
 
         # 2) Test Cases → copy rows that match source_version into target_version if not already present
-        exists_tcs = (
-            supabase_client.table("test_cases")
-            .select("id")
-            .eq("suite_id", suite_id_value)
-            .eq("version", target_version)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-        if not exists_tcs:
-            # Build map from requirement DB id -> req_code for lookup when writing
-            req_map_rows = (
-                supabase_client.table("requirements")
-                .select("id, req_code")
-                .eq("suite_id", suite_id_value)
-                .execute()
-                .data
-                or []
-            )
-            req_id_to_code: Dict[str, str] = {}
-            for r in req_map_rows:
-                rid = r.get("id")
-                code = r.get("req_code")
-                if rid and code:
-                    req_id_to_code[str(rid)] = str(code)
-
-            # Pull test_cases for the source_version
-            tc_rows = (
-                supabase_client.table("test_cases")
-                .select("requirement_id, content, version")
-                .eq("suite_id", suite_id_value)
-                .eq("version", source_version)
-                .execute()
-                .data
-                or []
-            )
-            bulk_rows: List[Dict[str, Any]] = []
-            for row in tc_rows:
-                rid = (
-                    str(row.get("requirement_id"))
-                    if row.get("requirement_id") is not None
-                    else None
-                )
-                if not rid:
-                    continue
-                req_code = req_id_to_code.get(rid)
-                if not req_code:
-                    continue
-                content = row.get("content")
-                if not isinstance(content, dict):
-                    continue
-                content_with_version = dict(content)
-                content_with_version["version"] = target_version
-                bulk_rows.append(
-                    {
-                        "req_code": str(req_code),
-                        "testcases": content_with_version,
-                        "version": target_version,
-                    }
-                )
-            if bulk_rows:
-                _results_writer.write_testcases_bulk(
-                    session_id=suite_id_value,
-                    suite_id=suite_id_value,
-                    rows=bulk_rows,
-                    version=target_version,
-                    active=True,
-                )
-
-        # 3) Test Design → copy rows that match source_version
-        exists_td = (
+       
+        td_rows = (
             supabase_client.table("test_designs")
-            .select("id")
+            .select("id, content, testing_type")
             .eq("suite_id", suite_id_value)
-            .eq("version", target_version)
-            .limit(1)
+            .eq("version", source_version)
             .execute()
             .data
             or []
         )
-        if not exists_td:
-            td_rows = (
-                supabase_client.table("test_designs")
-                .select("id, content, testing_type")
-                .eq("suite_id", suite_id_value)
-                .eq("version", source_version)
-                .execute()
-                .data
-                or []
+        if td_rows:
+            items = [
+                {
+                    "content": (td.get("content") or {}),
+                    "testing_type": td.get("testing_type"),
+                    "version": target_version,
+                }
+                for td in td_rows
+            ]
+            _results_writer.write_test_design_bulk(
+                session_id=suite_id_value,
+                suite_id=suite_id_value,
+                items=items,
+                version=target_version,
+                active=True,
             )
-            if td_rows:
-                items = [
-                    {
-                        "content": (td.get("content") or {}),
-                        "testing_type": str(td.get("testing_type") or "integration"),
-                        "version": target_version,
-                    }
-                    for td in td_rows
-                ]
-                _results_writer.write_test_design_bulk(
-                    session_id=suite_id_value,
-                    suite_id=suite_id_value,
-                    items=items,
-                    version=target_version,
-                    active=True,
-                )
 
-        # 4) Viewpoints → copy rows that match source_version
-        exists_vp = (
+        vp_rows = (
             supabase_client.table("viewpoints")
-            .select("id")
+            .select("content, test_design_id, requirement_id")
             .eq("suite_id", suite_id_value)
-            .eq("version", target_version)
-            .limit(1)
+            .eq("version", source_version)
             .execute()
             .data
             or []
         )
-        if not exists_vp:
-            vp_rows = (
-                supabase_client.table("viewpoints")
-                .select("content, test_design_id, requirement_id")
-                .eq("suite_id", suite_id_value)
-                .eq("version", source_version)
-                .execute()
-                .data
-                or []
+        if vp_rows:
+            items = [
+                {
+                    "content": (vp.get("content") or {}),
+                    "test_design_id": vp.get("test_design_id"),
+                    "requirement_id": vp.get("requirement_id"),
+                    "version": target_version,
+                }
+                for vp in vp_rows
+            ]
+            _results_writer.write_viewpoints_bulk(
+                session_id=suite_id_value,
+                suite_id=suite_id_value,
+                items=items,
+                version=target_version,
+                active=True,
             )
-            if vp_rows:
-                items = [
-                    {
-                        "content": (vp.get("content") or {}),
-                        "test_design_id": vp.get("test_design_id"),
-                        "requirement_id": vp.get("requirement_id"),
-                        "version": target_version,
-                    }
-                    for vp in vp_rows
-                ]
-                _results_writer.write_viewpoints_bulk(
-                    session_id=suite_id_value,
-                    suite_id=suite_id_value,
-                    items=items,
-                    version=target_version,
-                    active=True,
-                )
 
     def generate_and_store_testcases_for_req(
         req_id: Optional[str] = None, style: str = "json"
@@ -2633,7 +2528,6 @@ Documents:
         model_client=model_client,
         handoffs=["testcase_writer", "planner"],
         tools=[
-            generate_preview,
             extract_requirements,
             generate_test_design,
             generate_viewpoints,

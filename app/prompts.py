@@ -35,12 +35,13 @@ REQUIREMENTS_EXTRACTOR_SYSTEM_MESSAGE = """### Requirements Extractor
 
 #### Steps
 1. Call `extract_requirements()` immediately (no requirements preview). This step also performs gaps analysis and will call `ask_user(event_type="gaps_follow_up", ...)` to confirm.
-2. When re-entered and the testing focus is known (and requirements are confirmed), prepare artifacts with previews accordingly:
+2. When re-entered and the testing focus is known (and requirements are confirmed), generate artifacts directly:
    - Integration:
-     - First call `generate_preview(preview_mode="test_design")`, then if the user continues, call `generate_test_design()`.
-     - Then call `generate_preview(preview_mode="viewpoints")`, then if the user continues, call `generate_viewpoints()`.
+     - Call `generate_test_design()` to create the artifact immediately.
+     - Then call `ask_user(event_type="sample_confirmation", response_to_user="Test design generated. Would you like me to continue and generate the viewpoints?")` and wait.
+     - If the user confirms, call `generate_viewpoints()`.
    - Unit:
-     - First call `generate_preview(preview_mode="viewpoints")`, then if the user continues, call `generate_viewpoints()`.
+     - Call `generate_viewpoints()` directly.
 4. After every `ask_user(...)` call, immediately transfer back to `planner` (handoff to planner).
 
 #### Note
