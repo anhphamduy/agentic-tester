@@ -195,7 +195,9 @@ def make_team_for_suite(
             if new_version > 1:
                 try:
                     src_v = (
-                        int(source_version) if source_version is not None else int(new_version - 1)
+                        int(source_version)
+                        if source_version is not None
+                        else int(new_version - 1)
                     )
                     _clone_current_artifacts_to_version(src_v, int(new_version))
                 except Exception as e:
@@ -221,7 +223,6 @@ def make_team_for_suite(
         bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=80_000)
         if not bundle:
             raise ValueError("No .txt docs in suite.")
-        
 
         # Gaps analysis is now integrated into the extraction prompt/output
 
@@ -293,19 +294,21 @@ Documents:
         raw = resp.choices[0].message.content or "{}"
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, dict) and isinstance(parsed.get("requirements"), list):
+            if isinstance(parsed, dict) and isinstance(
+                parsed.get("requirements"), list
+            ):
                 reqs = parsed.get("requirements")
             elif isinstance(parsed, list):
                 # Backward-compat: accept a plain array of items
                 reqs = parsed
             else:
-                raise ValueError("Unexpected JSON shape; expected {requirements:[...]}" )
+                raise ValueError("Unexpected JSON shape; expected {requirements:[...]}")
         except Exception as e:
             raise ValueError(f"Invalid JSON from extractor: {e}")
 
         # Normalize keys for compatibility: ensure both 'requirement_description' and 'text'
         normalized_reqs: List[Dict[str, Any]] = []
-        for r in (reqs or []):
+        for r in reqs or []:
             if not isinstance(r, dict):
                 continue
             item = dict(r)
@@ -332,11 +335,14 @@ Documents:
 
         return ask_user(
             event_type="gaps_follow_up",
-            response_to_user=gaps_summary_text or "I didn't spot any obvious gaps in the docs. Shall we proceed?",
+            response_to_user=gaps_summary_text
+            or "I didn't spot any obvious gaps in the docs. Shall we proceed?",
         )
 
-    def _clone_current_artifacts_to_version(source_version: int, target_version: int) -> None:
- 
+    def _clone_current_artifacts_to_version(
+        source_version: int, target_version: int
+    ) -> None:
+
         rows = (
             supabase_client.table("requirements")
             .select("content")
@@ -346,9 +352,7 @@ Documents:
             .data
             or []
         )
-        reqs = [
-            r.get("content") for r in rows if isinstance(r.get("content"), dict)
-        ]
+        reqs = [r.get("content") for r in rows if isinstance(r.get("content"), dict)]
         if reqs:
             _results_writer.write_requirements(
                 session_id=suite_id_value,
@@ -358,7 +362,7 @@ Documents:
             )
 
         # 2) Test Cases → copy rows that match source_version into target_version if not already present
-       
+
         td_rows = (
             supabase_client.table("test_designs")
             .select("id, content, testing_type")
@@ -1065,9 +1069,7 @@ Requirement text:
                 vp_rows = []
             for r in vp_rows:
                 if isinstance(r, dict):
-                    linked_viewpoints.append(
-                        {"id": r.get("id"), "name": r.get("name")}
-                    )
+                    linked_viewpoints.append({"id": r.get("id"), "name": r.get("name")})
         except Exception:
             linked_viewpoints = []
         linked_viewpoint_ids = [
@@ -1245,7 +1247,9 @@ Viewpoints (subset):
         - Returns {new_version, restored_from}.
         """
         description = f"Restored from v{int(source_version)}"
-        new_version = _increment_suite_version(description, source_version=int(source_version))
+        new_version = _increment_suite_version(
+            description, source_version=int(source_version)
+        )
         if new_version is None:
             raise ValueError("Failed to create new version during restore")
 
@@ -1523,7 +1527,9 @@ Viewpoints (subset):
             resolved_req_id = req_row.get("id")
             latest_row = latest_tc_by_req_id.get(str(resolved_req_id))
             try:
-                old_version = int(edit_suite_version) if edit_suite_version is not None else None
+                old_version = (
+                    int(edit_suite_version) if edit_suite_version is not None else None
+                )
             except Exception:
                 old_version = None
 
@@ -1539,7 +1545,9 @@ Viewpoints (subset):
             try:
                 # Remove any existing test_cases rows for this requirement at the current edit version
                 try:
-                    supabase_client.table("test_cases").delete().eq("requirement_id", resolved_req_id).eq("version", edit_suite_version).execute()
+                    supabase_client.table("test_cases").delete().eq(
+                        "requirement_id", resolved_req_id
+                    ).eq("version", edit_suite_version).execute()
                 except Exception:
                     pass
                 _results_writer.write_testcases(
@@ -1601,8 +1609,7 @@ Viewpoints (subset):
         bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=12_000)
         if not bundle:
             raise ValueError("No .txt docs in suite.")
-        
-        user_ask_section = f"\nShort user ask: {ask}\n" if ask else ""
+
 
         mode = (preview_mode or "").strip().lower()
         if mode == "requirements":
@@ -1681,245 +1688,6 @@ Documents:
             response_to_user=preview_text,
         )
 
-        # Build a small structured preview list for modal table display in the UI
-        preview_data: Dict[str, Any] = {"preview_mode": mode or "auto"}
-
-        # Generate a tiny requirements sample (3–6 items) similar to extract_and_store_requirements
-        try:
-            req_sample_prompt = f"""
-You are a strict requirements extractor.
-From the provided documents, output a SMALL list of 3–6 atomic, verifiable requirements.
-
-Rules:
-- Each item must be testable and standalone.
-- Keep original meaning; do not add new constraints.
-- Include the source doc name for each requirement.
-- IDs must be REQ-1, REQ-2, ... in order of appearance.
-
-Return STRICT JSON only:
-{{
-  "requirements_sample": [
-    {{"id":"REQ-1","source":"<doc_name>","text":"<requirement>"}}
-  ]
-}}
-
-Documents:
-{bundle}
-""".strip()
-            req_resp = _oai.chat.completions.create(
-                model=global_settings.openai_model,
-                messages=[
-                    {"role": "system", "content": "Return strict JSON only; no extra text."},
-                    {"role": "user", "content": req_sample_prompt},
-                ],
-                reasoning_effort="minimal",
-                response_format={"type": "json_object"},
-            )
-            req_raw = req_resp.choices[0].message.content or "{}"
-            req_obj = json.loads(req_raw)
-            req_sample = req_obj.get("requirements_sample") or []
-            if not isinstance(req_sample, list):
-                req_sample = []
-        except Exception:
-            req_sample = []
-
-        req_rows = [
-            {"id": str((r or {}).get("id")), "source": str((r or {}).get("source")), "text": str((r or {}).get("text"))}
-            for r in (req_sample or [])
-            if isinstance(r, dict)
-        ][:6]
-
-        # Generate a tiny test cases sample aligned with generate_and_store_testcases_for_req
-        # Use the first requirement sample if available, otherwise let the model propose a plausible requirement.
-        try:
-            sample_req = next((r for r in (req_rows or []) if isinstance(r, dict)), None)
-            sample_req_id = (sample_req or {}).get("id") or "REQ-1"
-            sample_req_src = (sample_req or {}).get("source") or "unknown.txt"
-            sample_req_text = (sample_req or {}).get("text") or "A core functional requirement derived from the documents."
-
-            tc_sample_prompt = f"""
-You are a precise QA engineer. Write three concise, testable cases (happy, edge, negative) for the requirement below.
-
-Return STRICT JSON only with EXACTLY this shape:
-{{
-  "requirement_id": "{sample_req_id}",
-  "source": "{sample_req_src}",
-  "requirement_text": "<brief restatement>",
-  "cases": [
-    {{"id": "TC-1", "type": "happy", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}},
-    {{"id": "TC-2", "type": "edge", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": ""}},
-    {{"id": "TC-3", "type": "negative", "title": "<short>", "preconditions": ["..."], "steps": ["..."], "expected": "..."}}
-  ]
-}}
-
-Requirement text:
-{sample_req_text}
-""".strip()
-            tc_resp = _oai.chat.completions.create(
-                model=global_settings.openai_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Return strict JSON only; no extra text. Generate compact, testable QA cases with clear steps and expectations.",
-                    },
-                    {"role": "user", "content": tc_sample_prompt},
-                ],
-                reasoning_effort="minimal",
-                response_format={"type": "json_object"},
-            )
-            tc_raw = tc_resp.choices[0].message.content or "{}"
-            tc_obj = json.loads(tc_raw)
-            if not isinstance(tc_obj, dict):
-                tc_obj = {}
-        except Exception:
-            tc_obj = {}
-
-        # Normalize and flatten test case rows for an easy table display
-        def _flatten_tc_rows(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
-            try:
-                rid = str(obj.get("requirement_id") or "")
-                src = str(obj.get("source") or "")
-                cases = obj.get("cases") or []
-                rows: List[Dict[str, Any]] = []
-                if isinstance(cases, list):
-                    for c in cases:
-                        if not isinstance(c, dict):
-                            continue
-                        pre = c.get("preconditions")
-                        st = c.get("steps")
-                        pre_s = "\n".join(str(x) for x in pre) if isinstance(pre, list) else (str(pre) if pre is not None else "")
-                        st_s = "\n".join(str(x) for x in st) if isinstance(st, list) else (str(st) if st is not None else "")
-                        rows.append(
-                            {
-                                "requirement_id": rid,
-                                "source": src,
-                                "case_id": str(c.get("id") or ""),
-                                "type": str(c.get("type") or ""),
-                                "title": str(c.get("title") or ""),
-                                "preconditions": pre_s,
-                                "steps": st_s,
-                                "expected": str(c.get("expected") or ""),
-                            }
-                        )
-                return rows
-            except Exception:
-                return []
-
-        tc_rows = _flatten_tc_rows(tc_obj)[:6]
-
-        # Generate a small Viewpoints sample (only when requested)
-        vp_rows: List[Dict[str, Any]] = []
-        if mode == "viewpoints":
-            try:
-                vp_sample_prompt = f"""
-You are creating a SMALL Integration Test Viewpoints sample from the documents.
-Return STRICT JSON only:
-{{
-  "viewpoints_sample": [
-    {{"name": "Security", "scenario": "Auth + data protection checks", "references": {{"requirements": ["REQ-1"], "flows": ["IT-FLOW-01"]}}}}
-  ]
-}}
-
-Documents:
-{bundle}
-""".strip()
-                vp_resp = _oai.chat.completions.create(
-                    model=global_settings.openai_model,
-                    messages=[
-                        {"role": "system", "content": "Return strict JSON only; no extra text."},
-                        {"role": "user", "content": vp_sample_prompt},
-                    ],
-                    reasoning_effort="minimal",
-                    response_format={"type": "json_object"},
-                )
-                vp_raw = vp_resp.choices[0].message.content or "{}"
-                vp_obj = json.loads(vp_raw)
-                vps = vp_obj.get("viewpoints_sample") or []
-                if isinstance(vps, list):
-                    for v in vps[:6]:
-                        if not isinstance(v, dict):
-                            continue
-                        refs = v.get("references") or {}
-                        reqs = ", ".join(str(x) for x in (refs.get("requirements") or []) if x is not None)
-                        flows = ", ".join(str(x) for x in (refs.get("flows") or []) if x is not None)
-                        vp_rows.append({
-                            "name": str(v.get("name") or ""),
-                            "scenario": str(v.get("scenario") or ""),
-                            "requirements": reqs,
-                            "flows": flows,
-                        })
-            except Exception as e:
-
-                vp_rows = []
-
-        # Generate a small Test Design flows sample (only when requested)
-        flow_rows: List[Dict[str, Any]] = []
-        if mode == "test_design":
-            try:
-                td_sample_prompt = f"""
-You are creating a SMALL Integration Test Design sample (flows) from the documents.
-Return STRICT JSON only:
-{{
-  "flows": [
-    {{"id": "IT-FLOW-01", "name": "Login success", "description": "User enters valid credentials → token issued", "requirements_linked": ["REQ-1"]}}
-  ]
-}}
-
-Documents:
-{bundle}
-""".strip()
-                td_resp = _oai.chat.completions.create(
-                    model=global_settings.openai_model,
-                    messages=[
-                        {"role": "system", "content": "Return strict JSON only; no extra text."},
-                        {"role": "user", "content": td_sample_prompt},
-                    ],
-                    reasoning_effort="minimal",
-                    response_format={"type": "json_object"},
-                )
-                td_raw = td_resp.choices[0].message.content or "{}"
-                td_obj = json.loads(td_raw)
-                flows = td_obj.get("flows") or []
-                if isinstance(flows, list):
-                    for f in flows[:6]:
-                        if not isinstance(f, dict):
-                            continue
-                        reqs = ", ".join(str(x) for x in (f.get("requirements_linked") or []) if x is not None)
-                        flow_rows.append({
-                            "id": str(f.get("id") or ""),
-                            "name": str(f.get("name") or ""),
-                            "description": str(f.get("description") or ""),
-                            "requirements": reqs,
-                        })
-            except Exception as e:
-                import traceback
-                flow_rows = []
-
-        # Include only data for the selected preview mode
-        try:
-            if mode == "requirements":
-                preview_data["requirements"] = req_rows
-            elif mode == "testcases":
-                preview_data["testcases"] = tc_rows
-            elif mode == "viewpoints":
-                preview_data["viewpoints"] = vp_rows
-            elif mode == "test_design":
-                preview_data["flows"] = flow_rows
-            else:
-                # Auto: prefer requirements if available, otherwise testcases
-                if req_rows:
-                    preview_data["requirements"] = req_rows
-                elif tc_rows:
-                    preview_data["testcases"] = tc_rows
-        except Exception:
-            pass
-
-        return ask_user(
-            event_type="sample_confirmation",
-            response_to_user=preview_text,
-            data=preview_data,
-        )
-
     def generate_direct_testcases_on_docs(limit_per_doc: int = 6) -> str:
         """Generate concise test cases directly from the session docs without prior requirement extraction.
 
@@ -1932,7 +1700,6 @@ Documents:
         bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=16_000)
         if not bundle:
             raise ValueError("No .txt docs in suite.")
-        
 
         prompt = f"""
 You are a QA engineer. Generate concise, high-value TEST CASES directly from the documents below.
@@ -2052,7 +1819,9 @@ Documents:
                 reqs = []
 
         # Read docs context via service
-        docs_bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=16_000)
+        docs_bundle = _doc_service.read_docs_bundle(
+            suite_id_value, max_chars_per_doc=16_000
+        )
 
         # Build prompt from user specification
         req_ctx = json.dumps(reqs or [], ensure_ascii=False)
@@ -2192,7 +1961,9 @@ Documents:
         except Exception:
             pass
 
-        docs_bundle = _doc_service.read_docs_bundle(suite_id_value, max_chars_per_doc=10_000)
+        docs_bundle = _doc_service.read_docs_bundle(
+            suite_id_value, max_chars_per_doc=10_000
+        )
 
         req_ctx = json.dumps(reqs or [], ensure_ascii=False)
         if len(req_ctx) > 10_000:
@@ -2222,19 +1993,19 @@ Documents:
             "- Link each item to Requirement IDs and/or Integration Flow IDs when available.\n"
             "- If an item is derived purely from domain knowledge, keep both reference arrays empty.\n\n"
             "## Output Format (STRICT JSON ONLY; no markdown)\n"
-            "Return EXACTLY this shape. Use a single unified array named \"viewpoints\" representing table rows with these fields (no numbering, no suggested flag, no integration_test flag):\n"
+            'Return EXACTLY this shape. Use a single unified array named "viewpoints" representing table rows with these fields (no numbering, no suggested flag, no integration_test flag):\n'
             "{\n"
-            "  \"viewpoints\": [\n"
+            '  "viewpoints": [\n'
             "    {\n"
-            "      \"level1\": \"<Feature/Module>\",\n"
-            "      \"level2\": \"<Function>\",\n"
-            "      \"level3\": \"<success|fail|boundary|security|...>\",\n"
-            "      \"scenario\": \"<Scenario / Checkpoints; short sentences; bullets allowed using \\\\n - >\",\n"
-            "      \"requirement_references\": [\"REQ-1\"],\n"
-            "      \"test_design_references\": [\"IT-FLOW-01\"]\n"
+            '      "level1": "<Feature/Module>",\n'
+            '      "level2": "<Function>",\n'
+            '      "level3": "<success|fail|boundary|security|...>",\n'
+            '      "scenario": "<Scenario / Checkpoints; short sentences; bullets allowed using \\\\n - >",\n'
+            '      "requirement_references": ["REQ-1"],\n'
+            '      "test_design_references": ["IT-FLOW-01"]\n'
             "    }\n"
             "  ],\n"
-            "  \"summary\": \"<short overview>\"\n"
+            '  "summary": "<short overview>"\n'
             "}\n\n"
             "Guidance:\n"
             "- Keep scenarios concise and actionable; use \\\n - bullets when listing checkpoints.\n\n"
@@ -2270,9 +2041,14 @@ Documents:
                             "level1": "General",
                             "level2": str(r.get("id") or "Requirement"),
                             "level3": "integration",
-                            "scenario": str(r.get("text") or "Integration validation for requirement"),
-                            "requirement_references": [str(r.get("id"))] if r.get("id") else [],
-                            "test_design_references": []
+                            "scenario": str(
+                                r.get("text")
+                                or "Integration validation for requirement"
+                            ),
+                            "requirement_references": (
+                                [str(r.get("id"))] if r.get("id") else []
+                            ),
+                            "test_design_references": [],
                         }
                     )
                 data["viewpoints"] = synthesized
@@ -2292,7 +2068,9 @@ Documents:
         except Exception as e:
             raise ValueError(f"Invalid JSON from viewpoints generator: {e}")
 
-    def ask_user(event_type: str, response_to_user: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def ask_user(
+        event_type: str, response_to_user: str, data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Log a user-facing question to events and terminate the flow.
 
         Parameters:
@@ -2674,7 +2452,8 @@ async def run_stream_with_suite(
                 i.pop("call_id", None)
 
             if len(_event_payload["content"]) and (
-                _event_payload["content"][0].get("name") == "ask_user"
+                _event_payload["content"][0].get("name")
+                == "ask_user"
                 # or _event_payload["content"][0].get("name") == "generate_preview"
             ):
                 continue
