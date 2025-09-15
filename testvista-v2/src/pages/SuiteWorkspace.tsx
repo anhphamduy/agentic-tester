@@ -222,14 +222,8 @@ export default function SuiteWorkspace() {
         const aiTextMessage = !isUser && String(parsed?.type || "") === "TextMessage" && typeof parsed?.content === "string"
           ? normalizeMarkdown(String(parsed?.content ?? "")).replace(/\bTERMINATE\b/gi, "").trim()
           : null;
-        // Attach preview data into the AI text via a placeholder so ChatPanel can render a modal table
+        // Preview now returns table text only; no preview data suffix is appended
         let previewDataSuffix: string | null = null;
-        try {
-          if (!isUser && isSampleAsk && parsed && typeof parsed === "object" && parsed.data) {
-            const enc = JSON.stringify(parsed.data);
-            previewDataSuffix = `\n\n<<<PREVIEW_DATA:${enc}>>>`;
-          }
-        } catch {}
 
         const codeBlock = isUser
           ? (typeof parsed?.content === "string"
@@ -237,7 +231,7 @@ export default function SuiteWorkspace() {
               : String(parsed?.content ?? ""))
           : (
               (isQualityAsk || isSampleAsk || isReqFeedback || isTestingType || isGapsFollowUp) && typeof (parsed?.response_to_user || parsed?.responseToUser) === "string"
-                ? (String(parsed?.response_to_user || parsed?.responseToUser) + (previewDataSuffix || ""))
+                ? (String(parsed?.response_to_user || parsed?.responseToUser))
                 : (aiTextMessage ?? special ?? null)
             );
         const g = (grouped[mid] ||= { createdAt: ev.created_at, user: [], ai: [], aiType: undefined });
@@ -872,13 +866,8 @@ export default function SuiteWorkspace() {
           ) as Message["type"];
           const reqFeedbackText = isReqFeedback ? String(parsed?.response_to_user || parsed?.responseToUser || "") : "";
 
-          // Optional preview data suffix for sample-confirmation
+          // Preview now returns table text only; no preview data suffix
           let previewDataSuffix: string | null = null;
-          try {
-            if (isSampleAsk && parsed && typeof parsed === "object" && parsed.data) {
-              previewDataSuffix = "\n\n<<<PREVIEW_DATA:" + JSON.stringify(parsed.data) + ">>>";
-            }
-          } catch {}
 
           const aiTextMessage = !isUser && String(parsed?.type || "") === "TextMessage" && typeof parsed?.content === "string"
             ? normalizeMarkdown(String(parsed?.content ?? "")).replace(/\bTERMINATE\b/gi, "").trim()
@@ -889,7 +878,7 @@ export default function SuiteWorkspace() {
                 : String(parsed?.content ?? ""))
             : (
                 (isQualityAsk || isSampleAsk || isReqFeedback || isTestingType || isGapsFollowUp) && typeof (parsed?.response_to_user || parsed?.responseToUser) === "string"
-                  ? (String(parsed?.response_to_user || parsed?.responseToUser) + (previewDataSuffix || ""))
+                  ? (String(parsed?.response_to_user || parsed?.responseToUser))
                   : (aiTextMessage ?? special ?? "")
               );
 

@@ -10,6 +10,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Send, Bot, User, Upload, Zap, Target, Plus, Lightbulb, ArrowUp, AtSign, MessageSquare, Clock, FileText, File, RotateCcw, ChevronRight, MoreHorizontal, Eye } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { ArtifactSelectionChips } from "./artifact-selection-chips";
 import { NextStepChips } from "./next-step-chips";
 import { Logo } from "@/components/ui/logo";
@@ -249,13 +250,13 @@ export function ChatPanel({
                 ) : (
                   message.role === "user" ? (
                     <div className="text-white whitespace-pre-wrap break-words">
-                      <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{(message.content || '').trim()}</ReactMarkdown>
                     </div>
                   ) : (
                     message.type === "quality-confirmation" ? (
                       <div>
                         <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
-                          <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{(message.content || '').trim()}</ReactMarkdown>
                         </div>
                         <div className="mt-3 mb-2 flex gap-2">
                           <Button
@@ -306,7 +307,7 @@ export function ChatPanel({
                               {orderedSegments.map((seg, i) => (
                                 seg.kind === 'text' ? (
                                   <div key={i} className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
-                                    <ReactMarkdown>{seg.text}</ReactMarkdown>
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.text}</ReactMarkdown>
                                   </div>
                                 ) : (
                                   <div key={i} className="my-1">
@@ -384,7 +385,7 @@ export function ChatPanel({
                         return (
                           <div>
                             <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
-                              <ReactMarkdown>{(message.content || '').trim()}</ReactMarkdown>
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{(message.content || '').trim()}</ReactMarkdown>
                             </div>
                             <div className={cn(
                               "relative mt-3 mb-2 inline-flex max-w-[380px] w-full rounded-md overflow-hidden border border-border/50 divide-x divide-border/50",
@@ -431,7 +432,7 @@ export function ChatPanel({
                             return (
                               <div>
                                 <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
-                                  <ReactMarkdown>{content}</ReactMarkdown>
+                                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
                                 </div>
                                 <div className="mt-3 flex gap-2">
                                   <Button size="sm" className="h-7 px-3 text-xs mb-2" onClick={() => onSendMessage("Continue to generate test cases")} disabled={visibleMessages.slice(idx + 1).some(m => m.role === "user" && Boolean((m?.content || "").trim()))}>Continue to generate test cases</Button>
@@ -443,7 +444,7 @@ export function ChatPanel({
                             return (
                               <div>
                                 <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words">
-                                  <ReactMarkdown>{content}</ReactMarkdown>
+                                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
                                 </div>
                                 <div className={cn("mt-3 mb-2", disabledByLaterUser && "opacity-60")}> 
                                   <Button size="sm" className="h-7 px-3 text-xs mb-2" onClick={() => onSendMessage("Skip gaps and continue")} disabled={disabledByLaterUser}>Skip gaps</Button>
@@ -453,7 +454,7 @@ export function ChatPanel({
                           }
                           return (
                             <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words prose-pre:whitespace-pre-wrap prose-pre:break-words prose-pre:max-w-full prose-pre:overflow-x-auto">
-                              <ReactMarkdown>{content}</ReactMarkdown>
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
                             </div>
                           );
                         }
@@ -482,7 +483,7 @@ export function ChatPanel({
                           // fallback to plain markdown
                           return (
                             <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words prose-pre:whitespace-pre-wrap prose-pre:break-words prose-pre:max-w-full prose-pre:overflow-x-auto">
-                              <ReactMarkdown>{content}</ReactMarkdown>
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
                             </div>
                           );
                         }
@@ -493,7 +494,7 @@ export function ChatPanel({
                               if (seg.kind === 'text') {
                                 return (
                                   <div key={i} className="prose prose-sm max-w-none dark:prose-invert prose-p:my-2 prose-ul:my-2 prose-li:my-0 break-words prose-pre:whitespace-pre-wrap prose-pre:break-words prose-pre:max-w-full prose-pre:overflow-x-auto">
-                                    <ReactMarkdown>{seg.text.trim()}</ReactMarkdown>
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.text.trim()}</ReactMarkdown>
                                   </div>
                                 );
                               }

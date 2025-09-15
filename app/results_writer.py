@@ -13,7 +13,6 @@ class ResultsWriter:
         requirements: List[Dict[str, Any]],
         suite_id: Optional[str] = None,
         version: Optional[int] = None,
-        active: bool = True,
     ) -> None:
         raise NotImplementedError
 
@@ -132,7 +131,6 @@ class NoopResultsWriter(ResultsWriter):
         requirements: List[Dict[str, Any]],
         suite_id: Optional[str] = None,
         version: Optional[int] = None,
-        active: bool = True,
     ) -> None:
         return None
 
@@ -270,22 +268,17 @@ class SupabaseResultsWriter(ResultsWriter):
         requirements: List[Dict[str, Any]],
         suite_id: Optional[str] = None,
         version: Optional[int] = None,
-        active: bool = True,
     ) -> None:
         rows: List[Dict[str, Any]] = []
         for r in requirements:
             req_code = r.get("id") or ""
-            source_doc = r.get("source") or ""
             if not req_code:
                 continue
             rows.append(
                 {
                     "suite_id": suite_id,
-                    "req_code": req_code,
-                    "source_doc": source_doc,
                     "content": r,
                     "version": version,
-                    "active": bool(active),
                 }
             )
 

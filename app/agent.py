@@ -223,39 +223,7 @@ def make_team_for_suite(
             raise ValueError("No .txt docs in suite.")
         
 
-        # Start gaps analysis concurrently; write event only AFTER requirements are persisted
-        def _gaps_worker(bundle_str: str) -> str:
-            try:
-                gaps_prompt = f"""
-You are a warm, supportive QA analyst. Based ONLY on the documents, summarize gaps in a super friendly, human tone.
-
-Write:
-- A short, upbeat opener (you may use 1–2 light emojis like ✨🔧).
-- Exactly 4 friendly points (bullets or short lines). Each point must naturally mention: the document name, the section (or "General" if unclear), what the gap is, and a short suggested action. Feel free to phrase it conversationally.
-- End with one short, cheerful question that offers the choice to either skip the gaps and continue, or type extra details to supplement — wording can vary; do not use a fixed phrase.
-
-Keep it warm, reassuring, and concise (~70–110 words). No JSON. No code blocks.
-
-Documents:
-{bundle_str}
-""".strip()
-                fr_local = _oai.chat.completions.create(
-                    model=global_settings.openai_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Return plain text only in a super friendly tone: a short opener, exactly 4 friendly points (bullets or lines) each covering doc, section, gap, action, then a short cheerful closing question that offers either to skip the gaps and continue, or add/supplement details. Wording can vary. No JSON.",
-                        },
-                        {"role": "user", "content": gaps_prompt},
-                    ],
-                    reasoning_effort="minimal",
-                )
-                return fr_local.choices[0].message.content or ""
-            except Exception:
-                return ""
-
-        gaps_executor = ThreadPoolExecutor(max_workers=1)
-        gaps_future = gaps_executor.submit(_gaps_worker, bundle)
+        # Gaps analysis is now integrated into the extraction prompt/output
 
         prompt = f"""
 You are an expert requirements analyst.
@@ -284,6 +252,12 @@ Traceability Requirements:
   - source: Source Document Name (filename)
   - source_section: Source section / ID (e.g., heading, paragraph number, or requirement ID)
 
+Gaps Analysis:
+- Additionally, produce a short friendly natural-language summary of gaps called gaps_summary:
+  - Start with a warm opener (optionally 1–2 light emojis like ✨🔧).
+  - Exactly 4 concise points (bullets or short lines). Each point must mention: the document name, the section (or "General"), what the gap is, and a brief suggested action.
+  - End with a short, cheerful question offering to skip gaps and continue, or add details. Plain text only. No markdown.
+
 Output Format:
 Return STRICT JSON ONLY (no markdown) with EXACTLY this shape:
 {{
@@ -297,7 +271,8 @@ Return STRICT JSON ONLY (no markdown) with EXACTLY this shape:
       "source": "<Source Document Name>",
       "source_section": "<Source Section / ID>"
     }}
-  ]
+  ],
+  "gaps_summary": "are there any gaps in the documents and how to improve the documents to address the gaps? answer it as markdown please. short and succint" # empty string if there are no gaps
 }}
 
 ID Rules:
@@ -341,41 +316,24 @@ Documents:
 
         # Increment suite version and persist requirements (best-effort)
         version_now = _increment_suite_version("Requirements extracted")
-        try:
-            _results_writer.write_requirements(
-                session_id=suite_id_value,
-                requirements=normalized_reqs,
-                suite_id=suite_id_value,
-                version=version_now,
-                active=True,
-            )
-        except Exception:
-            pass
+        _results_writer.write_requirements(
+            session_id=suite_id_value,
+            requirements=normalized_reqs,
+            suite_id=suite_id_value,
+            version=version_now,
+        )
 
-        # After requirements are persisted, collect gaps result and log event
+        # Use integrated gaps summary from the extractor output if present
         gaps_summary_text = ""
-        try:
-            gaps_summary_text = gaps_future.result()
-        except Exception:
-            gaps_summary_text = ""
-        try:
-            gaps_executor.shutdown(wait=False)
-        except Exception:
-            pass
+        if isinstance(parsed, dict):
+            gs = parsed.get("gaps_summary")
+            if isinstance(gs, str):
+                gaps_summary_text = gs.strip()
 
-        # Use gaps follow-up as the requirements feedback step
-        try:
-            summary_text = gaps_summary_text or "I didn’t spot any obvious gaps in the docs. Shall we proceed?"
-            return ask_user(
-                event_type="gaps_follow_up",
-                response_to_user=summary_text,
-            )
-        except Exception:
-            return {
-                "status": "ok",
-                "message": "Requirements extracted successfully",
-                "gaps_summary": gaps_summary_text,
-            }
+        return ask_user(
+            event_type="gaps_follow_up",
+            response_to_user=gaps_summary_text or "I didn't spot any obvious gaps in the docs. Shall we proceed?",
+        )
 
     def _clone_current_artifacts_to_version(source_version: int, target_version: int) -> None:
         """Clone artifacts from a specific source_version to target_version so all artifact types have rows for the target."""
@@ -409,7 +367,6 @@ Documents:
                     requirements=reqs,
                     suite_id=suite_id_value,
                     version=target_version,
-                    active=True,
                 )
 
         # 2) Test Cases → copy rows that match source_version into target_version if not already present
@@ -1817,13 +1774,17 @@ Documents:
             messages=[
                 {
                     "role": "system",
-                    "content": "Return a friendly, user-facing preview that mirrors the upcoming artifacts. Use bullet lists and short sentences. No code blocks. Keep under ~160 words.",
+                    "content": "Return a friendly, user-facing preview rendered as a Markdown table that mirrors the upcoming artifacts. Use short cells. No code blocks. Keep under ~160 words.",
                 },
                 {"role": "user", "content": prompt},
             ],
             reasoning_effort="minimal",
         )
         preview_text = resp.choices[0].message.content or ""
+        return ask_user(
+            event_type="sample_confirmation",
+            response_to_user=preview_text,
+        )
 
         # Build a small structured preview list for modal table display in the UI
         preview_data: Dict[str, Any] = {"preview_mode": mode or "auto"}
