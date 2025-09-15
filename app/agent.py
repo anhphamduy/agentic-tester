@@ -1785,7 +1785,10 @@ Documents:
             {
               "id": "IT-FLOW-01",
               "name": "...",
-              "requirements_linked": ["REQ-1", "REQ-2"],
+              "links_artifacts": [
+                {"table_name": "requirements", "link_key": "req_id", "link_value": "REQ-1"},
+                {"table_name": "requirements", "link_key": "req_id", "link_value": "REQ-2"}
+              ],
               "description": "A → B → C"
             }
           ]
@@ -1847,13 +1850,16 @@ Documents:
             "       {\n"
             '         "id": "IT-FLOW-01",\n'
             '         "name": "...",\n'
-            '         "requirements_linked": ["REQ-1"],\n'
+            '         "links_artifacts": [\n'
+            '           {"table_name": "requirements", "link_key": "req_id", "link_value": "REQ-1"}\n'
+            '         ],\n'
             '         "description": "A → B → C"\n'
             "       }\n"
             "     ]\n"
             "   }\n\n"
             "Clarity & Traceability\n"
-            "- Every flow must map to Requirement IDs (use the IDs from the list).\n"
+            "- Represent all links via links_artifacts.\n"
+            "- For requirements, use table_name=\"requirements\", link_key=\"req_id\", link_value=<REQ-ID>.\n"
             "- You may include suggested flows if needed for coverage, but do not add a status field.\n\n"
             f"Requirement List (JSON):\n{req_ctx}\n\n"
             f"Documents:\n{docs_bundle}\n"
@@ -1990,8 +1996,8 @@ Documents:
             "- Ensure system-wide coverage: success, failure/negative, boundary & edge, exception handling, security, performance & load, usability & accessibility, data integrity & consistency, interoperability, error recovery & resilience, compliance/regulatory, and others suggested by context.\n"
             "- Treat the checklist as cross-cutting (not tied to any one flow order).\n\n"
             "## Traceability\n"
-            "- Link each item to Requirement IDs and/or Integration Flow IDs when available.\n"
-            "- If an item is derived purely from domain knowledge, keep both reference arrays empty.\n\n"
+            "- Use a generic array named links_artifacts for all linkages.\n"
+            "- If an item is derived purely from domain knowledge, links_artifacts may be empty.\n\n"
             "## Output Format (STRICT JSON ONLY; no markdown)\n"
             'Return EXACTLY this shape. Use a single unified array named "viewpoints" representing table rows with these fields (no numbering, no suggested flag, no integration_test flag):\n'
             "{\n"
@@ -2000,9 +2006,8 @@ Documents:
             '      "level1": "<Feature/Module>",\n'
             '      "level2": "<Function>",\n'
             '      "level3": "<success|fail|boundary|security|...>",\n'
-            '      "scenario": "<Scenario / Checkpoints; short sentences; bullets allowed using \\\\n - >",\n'
-            '      "requirement_references": ["REQ-1"],\n'
-            '      "test_design_references": ["IT-FLOW-01"]\n'
+            '      "scenario": "<Scenario / Checkpoints; short sentences; bullets allowed using \\\n - >",\n'
+            '      "links_artifacts": [{"table_name": "requirements", "link_key": "req_id", "link_value": "REQ-1"}]\n'
             "    }\n"
             "  ],\n"
             '  "summary": "<short overview>"\n'
@@ -2026,47 +2031,18 @@ Documents:
             reasoning_effort="minimal",
         )
         raw = resp.choices[0].message.content or "{}"
-        try:
-            data = json.loads(raw)
-            assert isinstance(data, dict)
-            # Ensure unified viewpoints array exists; synthesize minimal baseline if missing
-            vp = data.get("viewpoints")
-            if not isinstance(vp, list) or not vp:
-                synthesized: List[Dict[str, Any]] = []
-                for r in (reqs or [])[:15]:
-                    if not isinstance(r, dict):
-                        continue
-                    synthesized.append(
-                        {
-                            "level1": "General",
-                            "level2": str(r.get("id") or "Requirement"),
-                            "level3": "integration",
-                            "scenario": str(
-                                r.get("text")
-                                or "Integration validation for requirement"
-                            ),
-                            "requirement_references": (
-                                [str(r.get("id"))] if r.get("id") else []
-                            ),
-                            "test_design_references": [],
-                        }
-                    )
-                data["viewpoints"] = synthesized
-            # Increment suite version first, then persist with this version
-            version_now = _increment_suite_version("Generated viewpoints")
-            _results_writer.write_viewpoints(
-                session_id=suite_id_value,
-                suite_id=suite_id_value,
-                content=data,
-                test_design_id=test_design_id_value
-                or _SUITE_TEST_DESIGN_ID.get(suite_id_value),
-                testing_type="integration",
-                version=version_now,
-                active=True,
-            )
-            return "Viewpoints generated successfully"
-        except Exception as e:
-            raise ValueError(f"Invalid JSON from viewpoints generator: {e}")
+        data = json.loads(raw)
+        vp = data.get("viewpoints")
+
+        # Increment suite version first, then persist with this version
+        version_now = _increment_suite_version("Generated viewpoints")
+        _results_writer.write_viewpoints(
+            session_id=suite_id_value,
+            suite_id=suite_id_value,
+            data=vp,
+            version=version_now,
+        )
+        return "Viewpoints generated successfully"
 
     def ask_user(
         event_type: str, response_to_user: str, data: Optional[Dict[str, Any]] = None
