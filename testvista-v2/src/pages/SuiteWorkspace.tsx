@@ -611,71 +611,140 @@ export default function SuiteWorkspace() {
           return 1;
         })();
         const cases = Array.isArray(content?.cases) ? content.cases : [];
-        if (cases.length === 0) return;
-        cases.forEach((c: any, idx: number) => {
-          const caseIdRaw = c?.id;
-          const caseId =
-            caseIdRaw && String(caseIdRaw).trim()
-              ? stringifyCompact(caseIdRaw)
-              : `${reqId || "TC"}-${idx + 1}`;
-          out.push({
-            id: caseId,
-            title: stringifyCompact(c?.title),
-            steps: (() => {
-              try {
-                const s = c?.steps;
-                if (Array.isArray(s)) return s.map((x: any) => String(x)).join("\n");
-                if (typeof s === "string") {
-                  console.log(s)
-
-                  // Normalize any escaped newlines and convert common list separators to newlines
-                  return String(s)
-                    .replace(/\\r\\n/g, "\n")
-                    .replace(/\\n/g, "\n")
-                    .replace(/\s*;\s*/g, "\n");
+        if (cases.length > 0) {
+          cases.forEach((c: any, idx: number) => {
+            const caseIdRaw = c?.id;
+            const caseId =
+              caseIdRaw && String(caseIdRaw).trim()
+                ? stringifyCompact(caseIdRaw)
+                : `${reqId || "TC"}-${idx + 1}`;
+            // Include all additional fields from case content
+            const otherCaseFields: Record<string, any> = {};
+            try {
+              Object.keys(c || {}).forEach((k) => {
+                if ([
+                  "id",
+                  "title",
+                  "name",
+                  "steps",
+                  "expected",
+                  "expected_result",
+                  "severity",
+                  "type",
+                ].includes(k)) return;
+                otherCaseFields[k] = c[k];
+              });
+            } catch {}
+            // Include selected row-level fields (exclude raw content and conflicting ids)
+            const otherRowFields: Record<string, any> = {};
+            try {
+              Object.keys(r || {}).forEach((k) => {
+                if ([
+                  "content",
+                  "id",
+                  "version",
+                  "requirement_id",
+                  "req_id",
+                ].includes(k)) return;
+                otherRowFields[k] = r[k];
+              });
+            } catch {}
+            out.push({
+              ...otherRowFields,
+              ...otherCaseFields,
+              id: caseId,
+              title: stringifyCompact(c?.title || c?.name),
+              steps: (() => {
+                try {
+                  const s = c?.steps;
+                  if (Array.isArray(s)) return s.map((x: any) => String(x)).join("\n");
+                  if (typeof s === "string") {
+                    // Normalize any escaped newlines and convert common list separators to newlines
+                    return String(s)
+                      .replace(/\\r\\n/g, "\n")
+                      .replace(/\\n/g, "\n")
+                      .replace(/\s*;\s*/g, "\n");
+                  }
+                  return stringifyCompact(s);
+                } catch {
+                  return stringifyCompact(c?.steps);
                 }
-                return stringifyCompact(s);
-              } catch {
-                return stringifyCompact(c?.steps);
-              }
-            })(),
-            expected_result: stringifyCompact(c?.expected),
-            severity: stringifyCompact(c?.type),
-            links: (() => {
-              try {
-                const caseLinks = (c as any)?.links;
-                const fromCase = Array.isArray(caseLinks?.flows) ? caseLinks.flows : [];
-                const fromTop = Array.isArray((content as any)?.linked_flows)
-                  ? (content as any).linked_flows
-                  : [];
-                const merged = [...fromCase, ...fromTop].map((x: any) => String(x));
-                // de-duplicate while preserving order
-                const seen = new Set<string>();
-                const unique = merged.filter((v) => (seen.has(v) ? false : (seen.add(v), true)));
-                const flowsStr = unique.join(", ");
-
-                const vpFromCase = Array.isArray(caseLinks?.viewpoints) ? caseLinks.viewpoints : [];
-                const vpFromTop = Array.isArray((content as any)?.linked_viewpoints)
-                  ? (content as any).linked_viewpoints
-                  : [];
-                const vpMerged = [...vpFromCase, ...vpFromTop].map((x: any) => String(x));
-                const vpSeen = new Set<string>();
-                const vpUnique = vpMerged.filter((v) => (vpSeen.has(v) ? false : (vpSeen.add(v), true)));
-                const vpsStr = vpUnique.join(", ");
-
-                const parts: string[] = [];
-                if (reqId) parts.push(`Requirement: ${reqId}`);
-                if (flowsStr) parts.push(`Flows: ${flowsStr}`);
-                if (vpsStr) parts.push(`Viewpoints: ${vpsStr}`);
-                return parts.join("\n");
-              } catch {
-                return "";
-              }
-            })(),
-            requirement_id: reqId,
-            version,
+              })(),
+              expected_result: stringifyCompact(c?.expected || c?.expected_result),
+              severity: stringifyCompact(c?.severity || c?.type),
+              requirement_id: reqId,
+              version,
+            });
           });
-        });
+          return;
+        }
+
+        // Single-test-case per row format (no cases array)
+        const singleId = stringifyCompact(
+          content?.id ?? r?.id ?? `${reqId || "TC"}`
+        );
+        const singleSteps = (() => {
+          try {
+            const s = content?.steps ?? (content as any)?.step;
+            if (Array.isArray(s)) return s.map((x: any) => String(x)).join("\n");
+            if (typeof s === "string") {
+              return String(s)
+                .replace(/\\r\\n/g, "\n")
+                .replace(/\\n/g, "\n")
+                .replace(/\s*;\s*/g, "\n");
+            }
+            return stringifyCompact(s);
+          } catch {
+            return stringifyCompact(content?.steps);
+          }
+        })();
+        // Include all additional fields from single content and row-level
+        const otherContentFields: Record<string, any> = {};
+        try {
+          Object.keys((content as any) || {}).forEach((k) => {
+            if ([
+              "id",
+              "title",
+              "name",
+              "steps",
+              "expected",
+              "expected_result",
+              "result",
+              "severity",
+              "type",
+            ].includes(k)) return;
+            otherContentFields[k] = (content as any)[k];
+          });
+        } catch {}
+        const otherRowFieldsSingle: Record<string, any> = {};
+        try {
+          Object.keys(r || {}).forEach((k) => {
+            if ([
+              "content",
+              "id",
+              "version",
+              "requirement_id",
+              "req_id",
+            ].includes(k)) return;
+            otherRowFieldsSingle[k] = r[k];
+          });
+        } catch {}
+        const row = {
+          ...otherRowFieldsSingle,
+          ...otherContentFields,
+          id: singleId,
+          title: stringifyCompact(content?.title || content?.name || r?.name),
+          steps: singleSteps,
+          expected_result: stringifyCompact(
+            content?.expected || content?.expected_result || content?.result
+          ),
+          severity: stringifyCompact(
+            content?.severity || content?.type || (r as any)?.severity
+          ),
+          requirement_id: reqId,
+          version,
+        };
+        out.push(row);
       });
       return out;
     } catch {

@@ -284,48 +284,26 @@ class SupabaseResultsWriter(ResultsWriter):
         self,
         *,
         session_id: str,
-        req_code: str,
         testcases: Dict[str, Any],
         suite_id: Optional[str] = None,
         version: Optional[int] = None,
-        active: bool = True,
     ) -> None:
-        # Find requirement row by (suite_id, req_code)
-        req_row_id = self._get_requirement_row_id(suite_id=suite_id, req_code=req_code)
-        if not req_row_id:
-            # If requirement row not present, create a minimal one first
-            self._client.table("requirements").insert(
-                {
-                    "suite_id": suite_id,
-                    "req_code": req_code,
-                    "source_doc": testcases.get("source", ""),
-                    "content": {
-                        "id": req_code,
-                        "source": testcases.get("source", ""),
-                        "text": testcases.get("requirement_text", ""),
-                        "version": version,
-                        "active": bool(active),
-                    },
-                    "version": version,
-                    "active": bool(active),
-                }
-            ).execute()
-            req_row_id = self._get_requirement_row_id(
-                suite_id=suite_id, req_code=req_code
-            )
-            if not req_row_id:
-                return
-
-        # Insert new versioned active row
-        self._client.table("test_cases").insert(
-            {
-                "requirement_id": req_row_id,
+        payload_to_insert = []
+        for testcase in testcases:
+            payload = {
                 "suite_id": suite_id,
-                "content": testcases,
+                "content": testcase,
                 "version": version,
-                "active": bool(active),
             }
-        ).execute()
+
+            # handle update cases
+            if testcase.get("backend_id"):
+                payload["id"] = testcase.get("backend_id")
+                payload["content"] = testcase.get("content")
+
+            payload_to_insert.append(payload)
+
+        self._client.table("test_cases").upsert(payload_to_insert, on_conflict=["id"]).execute()
 
     def write_testcases_bulk(
         self,

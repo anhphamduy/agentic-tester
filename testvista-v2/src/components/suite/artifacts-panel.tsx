@@ -193,11 +193,8 @@ export function ArtifactsPanel({
       const flows = Array.isArray(content?.flows) ? content.flows : [];
       flows.forEach((f: any, idx: number) => {
         if (f && typeof f === "object") {
-          const reqs = Array.isArray(f?.requirements_linked)
-            ? f.requirements_linked.join(", ")
-            : (Array.isArray(f?.requirements) ? f.requirements.join(", ") : (f?.requirements_linked ?? f?.requirements ?? ""));
-          // Exclude test_design_id and created_at from table rows to hide these columns
-          rows.push({ ...f, requirements_linked: reqs });
+          const { requirements_linked: _rl, requirements: _r, ...rest } = f || {};
+          rows.push({ ...rest });
         } else {
           rows.push({ id: `${r?.id || "TD"}-FLOW-${idx + 1}`, value: String(f) });
         }
@@ -206,7 +203,54 @@ export function ArtifactsPanel({
     return rows;
   }, [dynamicTestDesignRows]);
   const tdFlowCount = tdFlowRows.length;
-  const dbVpCount = dynamicTestViewpointRows.length;
+  const dbVpRows = useMemo(() => {
+    const rows: any[] = [];
+    const parse = (v: any): any => {
+      if (v == null) return {};
+      if (typeof v === "string") {
+        try { return JSON.parse(v); } catch { return v; }
+      }
+      return v;
+    };
+    // We will display raw links_artifacts directly in the table
+    (dynamicTestViewpointRows || []).forEach((r: any) => {
+      const content = parse(r?.content);
+      const base = {
+        test_design_id: r?.test_design_id,
+        requirement_id: r?.requirement_id,
+        created_at: r?.created_at,
+      };
+      if (Array.isArray(content)) {
+        content.forEach((vp: any, idx: number) => {
+          if (vp && typeof vp === "object") {
+            rows.push({
+              id: vp?.id || `${r?.id || "VP"}-${idx + 1}`,
+              level1: vp?.level1,
+              level2: vp?.level2,
+              level3: vp?.level3,
+              scenario: vp?.scenario,
+              links_artifacts: vp?.links_artifacts,
+              ...base,
+            });
+          }
+        });
+      } else if (content && typeof content === "object") {
+        rows.push({
+          id: content?.id || r?.id,
+          level1: content?.level1,
+          level2: content?.level2,
+          level3: content?.level3,
+          scenario: content?.scenario,
+          links_artifacts: content?.links_artifacts,
+          ...base,
+        });
+      } else {
+        rows.push({ id: r?.id, content: String(content ?? ""), ...base });
+      }
+    });
+    return rows;
+  }, [dynamicTestViewpointRows]);
+  const dbVpCount = dbVpRows.length;
   const hasAnyArtifacts =
     (reqCount > 0) || (tcCount > 0) || (vpCount > 0) || (tdFlowCount > 0) || (dbVpCount > 0);
 
@@ -233,7 +277,7 @@ export function ArtifactsPanel({
     }
   }, [activeTab, vpCount, tdFlowCount, dbVpCount, reqCount, tcCount]);
 
-  const renderDynamicTable = (rows: any[], preferredOrder: string[] = []) => {
+  const renderDynamicTable = (rows: any[], preferredOrder: string[] = [], excludeKeys?: string[]) => {
     if (!rows || rows.length === 0) return null;
 
     // Helper: robust stringify for cell values
@@ -275,9 +319,19 @@ export function ArtifactsPanel({
       contentObjects.forEach((obj) =>
         Object.keys(obj || {}).forEach((k) => keySet.add(k))
       );
-      const allKeys = Array.from(keySet).filter(
-        (k) => !["version", "requirement_id", "requirementId", "reqIds", "req_ids"].includes(k)
-      );
+      const defaultExcluded = [
+        "version",
+        "requirement_id",
+        "requirementId",
+        "reqIds",
+        "req_ids",
+        "test_design_id",
+        "created_at",
+        "updated_at",
+        "suite_id",
+      ];
+      const excluded = excludeKeys !== undefined ? excludeKeys : defaultExcluded;
+      const allKeys = Array.from(keySet).filter((k) => !excluded.includes(k));
       const orderedKeys = [
         ...preferredOrder.filter((k) => allKeys.includes(k)),
         ...allKeys.filter((k) => !preferredOrder.includes(k)),
@@ -312,9 +366,19 @@ export function ArtifactsPanel({
     // Default: show all top-level fields across rows as columns
     const keySet = new Set<string>();
     rows.forEach((r) => Object.keys(r || {}).forEach((k) => keySet.add(k)));
-    const allKeys = Array.from(keySet).filter(
-      (k) => !["version", "requirement_id", "requirementId", "reqIds", "req_ids"].includes(k)
-    );
+    const defaultExcluded = [
+      "version",
+      "requirement_id",
+      "requirementId",
+      "reqIds",
+      "req_ids",
+      "test_design_id",
+      "created_at",
+      "updated_at",
+      "suite_id",
+    ];
+    const excluded = excludeKeys !== undefined ? excludeKeys : defaultExcluded;
+    const allKeys = Array.from(keySet).filter((k) => !excluded.includes(k));
     const orderedKeys = [
       ...preferredOrder.filter((k) => allKeys.includes(k)),
       ...allKeys.filter((k) => !preferredOrder.includes(k)),
@@ -812,7 +876,7 @@ export function ArtifactsPanel({
               <CardContent className="p-0 flex-1 min-h-0">
                 <div className="flex-1 h-full overflow-hidden border border-border/50 rounded-md">
                   <div className="h-full overflow-auto">
-                    {renderDynamicTable(tdFlowRows, ["id", "name", "requirements_linked", "description"]) || (
+                    {renderDynamicTable(tdFlowRows, ["id", "name", "description"], ["requirements_linked", "requirements"]) || (
                       <div className="p-6 text-center text-sm text-muted-foreground">No test design available.</div>
                     )}
                   </div>
@@ -828,7 +892,7 @@ export function ArtifactsPanel({
               <CardContent className="p-0 flex-1 min-h-0">
                 <div className="flex-1 h-full overflow-hidden border border-border/50 rounded-md">
                   <div className="h-full overflow-auto">
-                    {renderDynamicTable(dynamicTestViewpointRows, ["id", "test_design_id", "requirement_id", "name", "content", "created_at"]) || (
+                    {renderDynamicTable(dbVpRows, ["id", "level1", "level2", "level3", "scenario", "links_artifacts"]) || (
                       <div className="p-6 text-center text-sm text-muted-foreground">No test viewpoints available.</div>
                     )}
                   </div>
@@ -1004,14 +1068,16 @@ export function ArtifactsPanel({
                       ))}
                     </div>
                   ) : dynamicTestCaseRows.length > 0 ? (
-                    renderDynamicTable(dynamicTestCaseRows, [
-                      "id",
-                      "title",
-                      "steps",
-                      "expected_result",
-                      "severity",
-                      "links",
-                    ])
+                    renderDynamicTable(
+                      dynamicTestCaseRows,
+                      [
+                        "id",
+                        "title",
+                        "steps",
+                        "expected_result",
+                        "severity",
+                      ]
+                    )
                   ) : testCases.length === 0 ? (
                     <div className="p-6 text-center text-sm text-muted-foreground">
                       No test cases yet. Generate them from requirements or
@@ -1034,9 +1100,7 @@ export function ArtifactsPanel({
                           <TableHead className="hidden lg:table-cell min-w-32">
                             Expected Result
                           </TableHead>
-                          <TableHead className="hidden lg:table-cell min-w-40">
-                            Links
-                          </TableHead>
+                          {/* Links column removed per request */}
                           <TableHead className="w-16 min-w-16 sm:w-20">
                             Severity
                           </TableHead>
@@ -1122,9 +1186,7 @@ export function ArtifactsPanel({
                                 multiline
                               />
                             </TableCell>
-                            <TableCell className="hidden lg:table-cell whitespace-pre-wrap break-words max-w-[360px]">
-                              {(tc as any)?.links || ""}
-                            </TableCell>
+                            {/* Links cell removed */}
                             <TableCell>
                               <Badge className={getPriorityColor(tc.severity)}>
                                 {tc.severity}
